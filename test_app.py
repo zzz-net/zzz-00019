@@ -10,7 +10,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models import (
     Device, Borrower, BorrowRecord, Accessory, User, AppConfig,
-    DeviceStatus, RecordStatus, UserRole, MaintenanceRecord
+    DeviceStatus, RecordStatus, UserRole, MaintenanceRecord,
+    InventorySession, InventoryItem, InventoryStatus, InventoryItemResult
 )
 from business import EquipmentManager, BusinessError
 import storage
@@ -31,6 +32,7 @@ def setup_test_env():
     storage.CONFIG_FILE = os.path.join(TEST_DATA_DIR, "config.json")
     storage.IMPORT_LOGS_FILE = os.path.join(TEST_DATA_DIR, "import_logs.json")
     storage.MAINTENANCE_LOGS_FILE = os.path.join(TEST_DATA_DIR, "maintenance_logs.json")
+    storage.INVENTORY_FILE = os.path.join(TEST_DATA_DIR, "inventory_sessions.json")
 
 
 def cleanup_test_env():
@@ -1672,6 +1674,426 @@ def test_maintenance_frozen_device_remark_history():
                  "重启后 remark 历史持久化保留")
 
 
+def test_inventory_permission_roles():
+    print("\n=== 测试44: 月度盘点 - 角色权限 ===")
+    mgr = _fresh_manager()
+
+    mgr.switch_user("zhangsan")
+    assert_true(not mgr.has_permission("create_inventory"),
+                "借用人无 create_inventory 权限")
+    assert_true(not mgr.has_permission("fill_inventory"),
+                "借用人无 fill_inventory 权限")
+    assert_true(not mgr.has_permission("complete_inventory"),
+                "借用人无 complete_inventory 权限")
+    assert_true(not mgr.has_permission("view_inventory"),
+                "借用人无 view_inventory 权限")
+    assert_true(not mgr.has_permission("export_inventory"),
+                "借用人无 export_inventory 权限")
+    assert_true(mgr.has_permission("view_own_inventory"),
+                "借用人有 view_own_inventory 权限")
+    assert_raises(lambda: mgr.create_inventory("测试盘点", "", "all"),
+                  BusinessError, "借用人调用 create_inventory 抛出权限异常")
+
+    mgr.switch_user("wangwu")
+    assert_true(not mgr.has_permission("create_inventory"),
+                "验收人无 create_inventory 权限")
+    assert_true(not mgr.has_permission("complete_inventory"),
+                "验收人无 complete_inventory 权限")
+    assert_true(mgr.has_permission("fill_inventory"),
+                "验收人有 fill_inventory 权限")
+    assert_true(mgr.has_permission("view_inventory"),
+                "验收人有 view_inventory 权限")
+    assert_true(mgr.has_permission("export_inventory"),
+                "验收人有 export_inventory 权限")
+
+    mgr.switch_user("admin")
+    assert_true(mgr.has_permission("create_inventory"),
+                "管理员有 create_inventory 权限")
+    assert_true(mgr.has_permission("fill_inventory"),
+                "管理员有 fill_inventory 权限")
+    assert_true(mgr.has_permission("complete_inventory"),
+                "管理员有 complete_inventory 权限")
+    assert_true(mgr.has_permission("view_inventory"),
+                "管理员有 view_inventory 权限")
+    assert_true(mgr.has_permission("export_inventory"),
+                "管理员有 export_inventory 权限")
+
+
+def test_inventory_create_and_basic_flow():
+    print("\n=== 测试45: 月度盘点 - 创建盘点与基本填写流程 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+
+    assert_raises(lambda: mgr.create_inventory("", "", "all"),
+                  BusinessError, "空标题抛出异常")
+
+    all_dev_count = len(mgr.devices)
+    session = mgr.create_inventory("2026年6月盘点", "", "all")
+    assert_eq(session.title, "2026年6月盘点", "盘点标题正确")
+    assert_eq(session.status, InventoryStatus.DRAFT, "初始状态为草稿")
+    assert_eq(session.created_by, "admin", "创建人正确")
+    assert_eq(len(session.items), all_dev_count,
+              f"包含全部 {all_dev_count} 台设备")
+    assert_true(session.filter_conditions, "筛选条件已记录")
+    assert_eq(session.filter_conditions["status_filter"], "all",
+              "筛选条件状态=all")
+
+    avail_dev = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+    item = mgr.fill_inventory_item(
+        session.id, avail_dev.id,
+        actual_status=DeviceStatus.AVAILABLE,
+        actual_location="会议室A",
+        inventory_result=InventoryItemResult.NORMAL,
+        remark="设备完好"
+    )
+    assert_eq(item.actual_location, "会议室A", "实际位置已记录")
+    assert_eq(item.inventory_result, InventoryItemResult.NORMAL, "盘点结果正常")
+    assert_eq(item.filled_by, "admin", "填写人正确")
+    assert_true(item.filled_at, "填写时间非空")
+    assert_eq(session.status, InventoryStatus.IN_PROGRESS,
+              "填写后状态变为进行中")
+
+    for it in session.items:
+        if it.device_id != avail_dev.id:
+            mgr.fill_inventory_item(
+                session.id, it.device_id,
+                actual_status=it.original_status,
+                actual_location="默认位置",
+                inventory_result=InventoryItemResult.NORMAL,
+            )
+
+    completed = mgr.complete_inventory(session.id, "全部核对完毕")
+    assert_eq(completed.status, InventoryStatus.COMPLETED, "盘点已完成")
+    assert_true(completed.completed_at, "完成时间非空")
+    assert_eq(completed.completed_by, "admin", "完成操作人正确")
+
+    assert_raises(lambda: mgr.fill_inventory_item(session.id, avail_dev.id,
+                                                   actual_location="再改"),
+                  BusinessError, "已完成盘点不能再填写")
+    assert_raises(lambda: mgr.complete_inventory(session.id),
+                  BusinessError, "已完成盘点不能重复完成")
+
+    unfilled_session = mgr.create_inventory("未完成测试盘点", "", "all")
+    assert_raises(lambda: mgr.complete_inventory(unfilled_session.id),
+                  BusinessError, "未填写完的盘点不能完成")
+
+
+def test_inventory_persistence_across_restart():
+    print("\n=== 测试46: 月度盘点 - 跨重启持久化（草稿+进行中+已完成） ===")
+    setup_test_env()
+    mgr1 = EquipmentManager()
+    mgr1.switch_user("admin")
+
+    session_draft = mgr1.create_inventory("草稿盘点", "", "all")
+    session_prog = mgr1.create_inventory("进行中盘点", "", "all")
+    first_dev = session_prog.items[0]
+    mgr1.fill_inventory_item(
+        session_prog.id, first_dev.device_id,
+        actual_status=first_dev.original_status,
+        actual_location="位置X",
+        inventory_result=InventoryItemResult.NORMAL,
+    )
+    session_done = mgr1.create_inventory("已完成盘点", "", "all")
+    for it in session_done.items:
+        mgr1.fill_inventory_item(
+            session_done.id, it.device_id,
+            actual_status=it.original_status,
+            actual_location="位置Y",
+            inventory_result=InventoryItemResult.NORMAL,
+        )
+    mgr1.complete_inventory(session_done.id)
+
+    flt = {"category": "投影仪", "status_filter": "all", "keyword": ""}
+    mgr1.save_inventory_filter(flt)
+
+    mgr2 = EquipmentManager()
+    mgr2.switch_user("admin")
+
+    s_draft = mgr2.find_inventory_session(session_draft.id)
+    assert_true(s_draft is not None, "跨重启：草稿盘点存在")
+    assert_eq(s_draft.status, InventoryStatus.DRAFT, "草稿状态持久化")
+
+    s_prog = mgr2.find_inventory_session(session_prog.id)
+    assert_true(s_prog is not None, "跨重启：进行中盘点存在")
+    assert_eq(s_prog.status, InventoryStatus.IN_PROGRESS, "进行中状态持久化")
+    prog_item = mgr2._find_inventory_item(s_prog, first_dev.device_id)
+    assert_eq(prog_item.actual_location, "位置X", "填写内容持久化")
+
+    s_done = mgr2.find_inventory_session(session_done.id)
+    assert_true(s_done is not None, "跨重启：已完成盘点存在")
+    assert_eq(s_done.status, InventoryStatus.COMPLETED, "已完成状态持久化")
+    assert_true(s_done.completed_at, "完成时间持久化")
+
+    saved_flt = mgr2.get_last_inventory_filter()
+    assert_eq(saved_flt.get("category"), "投影仪", "筛选条件持久化：category")
+    assert_eq(saved_flt.get("status_filter"), "all", "筛选条件持久化：status_filter")
+
+
+def test_inventory_status_conflict_borrowed():
+    print("\n=== 测试47: 月度盘点 - 已借出设备状态冲突校验 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+
+    borrowed_dev = next(d for d in mgr.devices if d.status == DeviceStatus.BORROWED)
+    session = mgr.create_inventory("冲突测试盘点", device_ids=[borrowed_dev.id])
+    assert_eq(len(session.items), 1, "只选中已借出的那台设备")
+    item = session.items[0]
+    assert_eq(item.original_status, DeviceStatus.BORROWED,
+              "原状态记录为已借出")
+
+    ok_fill, _ = False, ""
+    try:
+        mgr.fill_inventory_item(
+            session.id, borrowed_dev.id,
+            actual_status=DeviceStatus.AVAILABLE,
+            inventory_result=InventoryItemResult.MISSING,
+        )
+        ok_fill = True
+    except BusinessError:
+        ok_fill = False
+    assert_true(not ok_fill, "已借出设备不能改为其他状态并标记异常")
+
+    item_ok = mgr.fill_inventory_item(
+        session.id, borrowed_dev.id,
+        actual_status=DeviceStatus.BORROWED,
+        actual_location="借用人办公室",
+        inventory_result=InventoryItemResult.NORMAL,
+    )
+    assert_eq(item_ok.actual_status, DeviceStatus.BORROWED,
+              "保持原状态可以正常填写")
+
+    dev_after = mgr.find_device(borrowed_dev.id)
+    assert_eq(dev_after.status, DeviceStatus.BORROWED,
+              "盘点过程没有覆盖设备实际业务状态")
+
+
+def test_inventory_status_conflict_maintenance_and_frozen():
+    print("\n=== 测试48: 月度盘点 - 维修中/异常冻结状态冲突校验 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+
+    avail_dev = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+    frozen_dev = next(d for d in mgr.devices if d.status == DeviceStatus.FROZEN)
+    mgr.send_to_maintenance(avail_dev.id, "定期保养", "")
+    maint_dev = avail_dev
+
+    session = mgr.create_inventory("状态冲突盘点2",
+                                    device_ids=[maint_dev.id, frozen_dev.id])
+
+    try:
+        mgr.fill_inventory_item(
+            session.id, maint_dev.id,
+            actual_status=DeviceStatus.AVAILABLE,
+            inventory_result=InventoryItemResult.DAMAGED,
+        )
+        assert_true(False, "维修中设备改为其他状态应当抛出异常")
+    except BusinessError as e:
+        assert_true("维修" in str(e), "错误消息包含'维修'关键词")
+
+    maint_item = mgr.fill_inventory_item(
+        session.id, maint_dev.id,
+        actual_status=DeviceStatus.MAINTENANCE,
+        actual_location="维修部",
+        inventory_result=InventoryItemResult.NORMAL,
+    )
+    assert_eq(maint_item.actual_status, DeviceStatus.MAINTENANCE,
+              "维修中设备保持原状态可以填写")
+
+    try:
+        mgr.fill_inventory_item(
+            session.id, frozen_dev.id,
+            actual_status=DeviceStatus.AVAILABLE,
+            inventory_result=InventoryItemResult.LOCATION_WRONG,
+        )
+        assert_true(False, "冻结设备改为其他状态应当抛出异常")
+    except BusinessError as e:
+        assert_true("冻结" in str(e), "错误消息包含'冻结'关键词")
+
+    frozen_item = mgr.fill_inventory_item(
+        session.id, frozen_dev.id,
+        actual_status=DeviceStatus.FROZEN,
+        actual_location="仓库-待处理区",
+        inventory_result=InventoryItemResult.NORMAL,
+    )
+    assert_eq(frozen_item.actual_status, DeviceStatus.FROZEN,
+              "冻结设备保持原状态可以填写")
+
+    assert_eq(mgr.find_device(maint_dev.id).status, DeviceStatus.MAINTENANCE,
+              "维修中设备状态未被盘点覆盖")
+    assert_eq(mgr.find_device(frozen_dev.id).status, DeviceStatus.FROZEN,
+              "冻结设备状态未被盘点覆盖")
+
+
+def test_inventory_borrower_can_only_view_own():
+    print("\n=== 测试49: 月度盘点 - 借用人只能看自己相关设备的盘点结论 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+
+    zhangsan = next(b for b in mgr.borrowers if b.name == "张三")
+    avail_for_zs = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+    mgr.borrow_device(
+        avail_for_zs.id, zhangsan.id,
+        (datetime.now() + timedelta(days=5)).strftime("%Y-%m-%d %H:%M:%S"),
+        remark="张三借用测试"
+    )
+
+    session = mgr.create_inventory("借用人视角盘点", "", "all")
+    for it in session.items:
+        mgr.fill_inventory_item(
+            session.id, it.device_id,
+            actual_status=it.original_status,
+            actual_location="某处",
+            inventory_result=(InventoryItemResult.NORMAL
+                              if it.device_id != avail_for_zs.id
+                              else InventoryItemResult.ACCESSORY_MISSING),
+            missing_accessories=(["HDMI线"]
+                                 if it.device_id == avail_for_zs.id else []),
+        )
+    mgr.complete_inventory(session.id)
+
+    mgr.switch_user("zhangsan")
+    visible = mgr.get_inventory_sessions()
+    assert_true(len(visible) >= 1, "张三至少能看到1条已完成盘点")
+    for s in visible:
+        for it in s.items:
+            is_related = any(
+                r.device_id == it.device_id
+                and (r.borrower_name == "张三" or r.borrower_id == "zhangsan")
+                for r in mgr.records
+            )
+            assert_true(is_related,
+                        f"张三只能看到与自己借用相关的盘点设备（{it.device_name}）")
+
+    mgr.switch_user("lisi")
+    visible_lisi = mgr.get_inventory_sessions()
+    zs_related = [it for s in visible_lisi for it in s.items]
+    for it in zs_related:
+        is_related_to_lisi = any(
+            r.device_id == it.device_id
+            and (r.borrower_name == "李四" or r.borrower_id == "lisi")
+            for r in mgr.records
+        )
+        assert_true(is_related_to_lisi,
+                    "李四看不到张三借用相关的盘点设备")
+
+
+def test_inventory_export_completed_with_meta():
+    print("\n=== 测试50: 月度盘点 - 完成后CSV/JSON导出（含筛选条件、操作人、异常数量） ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+
+    session = mgr.create_inventory("6月导出测试盘点", category="投影仪",
+                                    remark="导出专用")
+    abnormal_count = 0
+    for i, it in enumerate(session.items):
+        if i == 0:
+            mgr.fill_inventory_item(
+                session.id, it.device_id,
+                actual_status=it.original_status,
+                actual_location="会议室B",
+                inventory_result=InventoryItemResult.ACCESSORY_MISSING,
+                missing_accessories=["遥控器"],
+            )
+            abnormal_count += 1
+        else:
+            mgr.fill_inventory_item(
+                session.id, it.device_id,
+                actual_status=it.original_status,
+                actual_location="仓库",
+                inventory_result=InventoryItemResult.NORMAL,
+            )
+    mgr.complete_inventory(session.id)
+    assert_eq(mgr.get_inventory_exception_count(session), abnormal_count,
+              f"异常数量为 {abnormal_count}")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ok, _ = mgr.set_export_dir(tmpdir)
+        assert_true(ok, "导出目录设置成功")
+
+        csv_path = os.path.join(tmpdir, "inventory_june.csv")
+        ok, msg = mgr.export_inventory_session(session.id, csv_path)
+        assert_true(ok, f"CSV 导出成功: {msg}")
+        assert_true(os.path.exists(csv_path) and os.path.getsize(csv_path) > 0,
+                    "CSV 文件存在且非空")
+        with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            lines = list(reader)
+        has_title = any("盘点标题" in str(cell) for row in lines for cell in row)
+        has_operator = any("导出操作人" in str(cell) for row in lines for cell in row)
+        has_exception = any("异常数量" in str(cell) for row in lines for cell in row)
+        has_filter = any("筛选条件" in str(cell) for row in lines for cell in row)
+        assert_true(has_title, "CSV 包含盘点标题")
+        assert_true(has_operator, "CSV 包含导出操作人")
+        assert_true(has_exception, "CSV 包含异常数量")
+        assert_true(has_filter, "CSV 包含筛选条件")
+        has_header = any("设备ID" in str(cell) for row in lines for cell in row)
+        assert_true(has_header, "CSV 包含数据表头")
+
+        json_path = os.path.join(tmpdir, "inventory_june.json")
+        ok, msg = mgr.export_inventory_session(session.id, json_path)
+        assert_true(ok, f"JSON 导出成功: {msg}")
+        assert_true(os.path.exists(json_path) and os.path.getsize(json_path) > 0,
+                    "JSON 文件存在且非空")
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        assert_true("export_operator" in data, "JSON 顶层含 export_operator")
+        assert_eq(data["export_operator"], "admin", "操作人为 admin")
+        assert_true("exception_count" in data, "JSON 顶层含 exception_count")
+        assert_eq(data["exception_count"], abnormal_count,
+                  f"异常数量为 {abnormal_count}")
+        assert_true("session" in data, "JSON 顶层含 session")
+        assert_eq(data["session"]["title"], "6月导出测试盘点",
+                  "session 标题正确")
+        assert_true("filter_conditions" in data["session"],
+                    "session 中含筛选条件")
+        assert_eq(data["session"]["filter_conditions"]["category"], "投影仪",
+                  "筛选条件 category=投影仪")
+
+        draft_sess = mgr.create_inventory("草稿盘点不导出", "", "all")
+        ok_draft, msg_draft = mgr.export_inventory_session(draft_sess.id,
+                                                            os.path.join(tmpdir, "draft.csv"))
+        assert_true(not ok_draft, "草稿状态盘点不能导出")
+        assert_true("已完成" in msg_draft, "提示只有已完成才能导出")
+
+
+def test_inventory_create_with_filter_and_device_ids():
+    print("\n=== 测试51: 月度盘点 - 按筛选条件和手动指定设备ID创建 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+
+    proj_count = len([d for d in mgr.devices if d.category == "投影仪"])
+    assert_true(proj_count >= 1, "系统中至少有1台投影仪")
+    session_cat = mgr.create_inventory("投影仪专项盘点", category="投影仪")
+    assert_eq(len(session_cat.items), proj_count,
+              f"按类别筛选包含 {proj_count} 台投影仪")
+    for it in session_cat.items:
+        dev = mgr.find_device(it.device_id)
+        assert_eq(dev.category, "投影仪", f"设备 {dev.name} 属于投影仪")
+
+    avail_count = len([d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE])
+    session_status = mgr.create_inventory("可用设备盘点",
+                                           status_filter=DeviceStatus.AVAILABLE)
+    assert_eq(len(session_status.items), avail_count,
+              f"按状态筛选包含 {avail_count} 台可用设备")
+
+    selected_ids = [mgr.devices[0].id, mgr.devices[1].id]
+    session_ids = mgr.create_inventory("手动指定盘点", device_ids=selected_ids)
+    assert_eq(len(session_ids.items), 2, "手动指定2台设备")
+    item_ids = {it.device_id for it in session_ids.items}
+    assert_eq(item_ids, set(selected_ids), "手动指定的设备ID正确")
+
+    assert_raises(lambda: mgr.create_inventory("空盘点", device_ids=["NO_SUCH_ID"]),
+                  BusinessError, "无效设备ID列表抛出异常")
+
+    empty_cat_session = None
+    try:
+        empty_cat_session = mgr.create_inventory("不存在类别盘点",
+                                                   category="完全不存在的类别")
+        assert_true(False, "空筛选结果应当抛出异常")
+    except BusinessError:
+        assert_true(True, "空筛选结果正确抛出异常")
+
+
 def main():
     setup_test_env()
     try:
@@ -1718,6 +2140,14 @@ def main():
         test_maintenance_log_persistence_across_restart()
         test_maintenance_cancel_boundary_after_restart()
         test_maintenance_frozen_device_remark_history()
+        test_inventory_permission_roles()
+        test_inventory_create_and_basic_flow()
+        test_inventory_persistence_across_restart()
+        test_inventory_status_conflict_borrowed()
+        test_inventory_status_conflict_maintenance_and_frozen()
+        test_inventory_borrower_can_only_view_own()
+        test_inventory_export_completed_with_meta()
+        test_inventory_create_with_filter_and_device_ids()
     finally:
         cleanup_test_env()
 

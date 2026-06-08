@@ -6,7 +6,8 @@ from typing import List, Optional, Tuple, Dict
 from models import (
     Device, Borrower, BorrowRecord, User, AppConfig,
     DeviceStatus, RecordStatus, UserRole, Accessory, _now_str,
-    ImportPrecheckSummary, ImportLogEntry, MaintenanceRecord
+    ImportPrecheckSummary, ImportLogEntry, MaintenanceRecord,
+    InventorySession, InventoryItem
 )
 
 
@@ -18,6 +19,7 @@ USERS_FILE = os.path.join(DATA_DIR, "users.json")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 IMPORT_LOGS_FILE = os.path.join(DATA_DIR, "import_logs.json")
 MAINTENANCE_LOGS_FILE = os.path.join(DATA_DIR, "maintenance_logs.json")
+INVENTORY_FILE = os.path.join(DATA_DIR, "inventory_sessions.json")
 
 
 IMPORT_REQUIRED_FIELDS = [
@@ -431,6 +433,65 @@ def export_maintenance_json(logs: List[MaintenanceRecord], filepath: str,
             }
             if filter_info:
                 data["filter_info"] = dict(filter_info)
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except (IOError, OSError):
+        return False
+
+
+def save_inventory_sessions(sessions: List[InventorySession]):
+    _save_json(INVENTORY_FILE, [s.to_dict() for s in sessions])
+
+
+def load_inventory_sessions() -> List[InventorySession]:
+    data = _load_json(INVENTORY_FILE, [])
+    return [InventorySession.from_dict(d) for d in data]
+
+
+def export_inventory_csv(session: InventorySession, filepath: str,
+                         operator: str = "", exception_count: int = 0) -> bool:
+    try:
+        with open(filepath, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([f"# 盘点标题: {session.title}"])
+            writer.writerow([f"# 盘点ID: {session.id}"])
+            writer.writerow([f"# 盘点状态: {session.status}"])
+            writer.writerow([f"# 创建人: {session.created_by}"])
+            writer.writerow([f"# 创建时间: {session.created_at}"])
+            writer.writerow([f"# 完成时间: {session.completed_at}"])
+            writer.writerow([f"# 导出操作人: {operator}"])
+            writer.writerow([f"# 异常数量: {exception_count}"])
+            if session.filter_conditions:
+                writer.writerow(["# 筛选条件:"])
+                for k, v in session.filter_conditions.items():
+                    writer.writerow([f"#   {k}: {v}"])
+            writer.writerow([
+                "设备ID", "设备名称", "系统原状态", "盘点实际状态",
+                "实际位置", "缺失配件", "盘点结果", "填写人", "填写时间", "备注"
+            ])
+            for it in session.items:
+                writer.writerow([
+                    it.device_id, it.device_name, it.original_status,
+                    it.actual_status, it.actual_location,
+                    "; ".join(it.missing_accessories),
+                    it.inventory_result, it.filled_by,
+                    it.filled_at, it.remark
+                ])
+        return True
+    except (IOError, OSError):
+        return False
+
+
+def export_inventory_json(session: InventorySession, filepath: str,
+                          operator: str = "", exception_count: int = 0) -> bool:
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            data = {
+                "export_time": _now_str(),
+                "export_operator": operator,
+                "exception_count": exception_count,
+                "session": session.to_dict(),
+            }
             json.dump(data, f, ensure_ascii=False, indent=2)
         return True
     except (IOError, OSError):

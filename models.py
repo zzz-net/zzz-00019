@@ -42,12 +42,16 @@ class UserRole:
                 "close_record", "export_data", "import_records", "view_all",
                 "set_reminder_days",
                 "send_to_maintenance", "cancel_maintenance",
-                "view_maintenance", "export_maintenance"],
-        BORROWER: ["borrow_device", "view_own", "export_data"],
+                "view_maintenance", "export_maintenance",
+                "create_inventory", "fill_inventory", "complete_inventory",
+                "view_inventory", "export_inventory"],
+        BORROWER: ["borrow_device", "view_own", "export_data",
+                   "view_own_inventory"],
         INSPECTOR: ["inspect_return", "return_device", "close_record",
                     "view_all", "export_data", "import_records",
                     "set_reminder_days",
-                    "view_maintenance", "export_maintenance"],
+                    "view_maintenance", "export_maintenance",
+                    "fill_inventory", "view_inventory", "export_inventory"],
     }
 
     @classmethod
@@ -253,6 +257,73 @@ class MaintenanceRecord:
 
 
 @dataclass
+class InventoryStatus:
+    DRAFT = "草稿"
+    IN_PROGRESS = "进行中"
+    COMPLETED = "已完成"
+
+
+class InventoryItemResult:
+    NORMAL = "正常"
+    MISSING = "丢失"
+    DAMAGED = "损坏"
+    LOCATION_WRONG = "位置错误"
+    ACCESSORY_MISSING = "配件缺失"
+    OTHER = "其他异常"
+
+    ALL_RESULTS = [NORMAL, MISSING, DAMAGED, LOCATION_WRONG, ACCESSORY_MISSING, OTHER]
+
+
+@dataclass
+class InventoryItem:
+    device_id: str = ""
+    device_name: str = ""
+    original_status: str = ""
+    actual_status: str = ""
+    actual_location: str = ""
+    missing_accessories: List[str] = field(default_factory=list)
+    remark: str = ""
+    inventory_result: str = ""
+    filled_by: str = ""
+    filled_by_role: str = ""
+    filled_at: str = ""
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict):
+        return cls(**d)
+
+
+@dataclass
+class InventorySession:
+    id: str = field(default_factory=_new_id)
+    title: str = ""
+    status: str = InventoryStatus.DRAFT
+    created_by: str = ""
+    created_by_role: str = ""
+    created_at: str = field(default_factory=_now_str)
+    completed_at: str = ""
+    completed_by: str = ""
+    completed_by_role: str = ""
+    filter_conditions: dict = field(default_factory=dict)
+    items: List[InventoryItem] = field(default_factory=list)
+    remark: str = ""
+
+    def to_dict(self):
+        d = asdict(self)
+        d["items"] = [it.to_dict() for it in self.items]
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict):
+        d = dict(d)
+        d["items"] = [InventoryItem.from_dict(it) for it in d.get("items", [])]
+        return cls(**d)
+
+
+@dataclass
 class AppConfig:
     export_dir: str = ""
     last_user: str = ""
@@ -263,6 +334,7 @@ class AppConfig:
     default_maintenance_days: int = 7
     last_maintenance_filter: dict = field(default_factory=dict)
     maintenance_records_snapshot: dict = field(default_factory=dict)
+    last_inventory_filter: dict = field(default_factory=dict)
 
     def to_dict(self):
         return asdict(self)

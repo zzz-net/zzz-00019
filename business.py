@@ -5,7 +5,8 @@ from typing import List, Optional, Tuple, Dict, Any
 from models import (
     Device, Borrower, BorrowRecord, User, Accessory,
     DeviceStatus, RecordStatus, UserRole, _now_str,
-    ImportPrecheckSummary, ImportLogEntry, MaintenanceRecord
+    ImportPrecheckSummary, ImportLogEntry, MaintenanceRecord,
+    InventorySession, InventoryItem, InventoryStatus, InventoryItemResult
 )
 import storage
 
@@ -21,6 +22,7 @@ class EquipmentManager:
         self.records: List[BorrowRecord] = []
         self.users: List[User] = []
         self.maintenance_logs: List[MaintenanceRecord] = []
+        self.inventory_sessions: List[InventorySession] = []
         self.config = storage.AppConfig()
         self.current_user: Optional[User] = None
         self._records_snapshot_at_last_maintenance: Dict[str, str] = {}
@@ -33,6 +35,7 @@ class EquipmentManager:
         self.records = storage.load_records()
         self.users = storage.load_users()
         self.maintenance_logs = storage.load_maintenance_logs()
+        self.inventory_sessions = storage.load_inventory_sessions()
         self.config = storage.load_config()
         self._records_snapshot_at_last_maintenance = dict(
             self.config.maintenance_records_snapshot or {}
@@ -46,6 +49,7 @@ class EquipmentManager:
         storage.save_records(self.records)
         storage.save_users(self.users)
         storage.save_maintenance_logs(self.maintenance_logs)
+        storage.save_inventory_sessions(self.inventory_sessions)
         storage.save_config(self.config)
 
     def find_user(self, username: str) -> Optional[User]:
@@ -972,3 +976,246 @@ class EquipmentManager:
 
     def get_last_maintenance_filter(self) -> dict:
         return dict(self.config.last_maintenance_filter or {})
+
+    def find_inventory_session(self, session_id: str) -> Optional[InventorySession]:
+        return next((s for s in self.inventory_sessions if s.id == session_id), None)
+
+    def _has_device_active_business(self, device_id: str) -> Tuple[bool, str]:
+        device = self.find_device(device_id)
+        if not device:
+            return False, ""
+        if device.status == DeviceStatus.BORROWED:
+            active = self.get_active_record_for_device(device_id)
+            if active:
+                return True, f"设备【{device.name}】已借出，借用人：{active.borrower_name}"
+        if device.status == DeviceStatus.INSPECTING:
+            return True, f"设备【{device.name}】处于归还验收中"
+        if device.status == DeviceStatus.MAINTENANCE:
+            active_m = self.get_active_maintenance_for_device(device_id)
+            if active_m:
+                return True, f"设备【{device.name}】正在维修/保养中，原因：{active_m.reason}"
+        if device.status == DeviceStatus.FROZEN:
+            return True, f"设备【{device.name}】处于异常冻结状态"
+        return False, ""
+
+    def _filter_devices_for_inventory(self, category: str = "",
+                                       status_filter: str = "all",
+                                       keyword: str = "") -> List[Device]:
+        result = list(self.devices)
+        if category and category.strip():
+            cat = category.strip()
+            result = [d for d in result if d.category == cat]
+        if status_filter and status_filter != "all":
+            result = [d for d in result if d.status == status_filter]
+        if keyword and keyword.strip():
+            kw = keyword.strip().lower()
+            result = [d for d in result
+                      if kw in d.name.lower()
+                      or kw in (d.model or "").lower()
+                      or kw in (d.serial_no or "").lower()
+                      or kw in d.id.lower()]
+        return result
+
+    def create_inventory(self, title: str, category: str = "",
+                         status_filter: str = "all", keyword: str = "",
+                         device_ids: Optional[List[str]] = None,
+                         remark: str = "") -> InventorySession:
+        self._require_permission("create_inventory")
+        if not title or not str(title).strip():
+            raise BusinessError("盘点标题不能为空")
+
+        if device_ids:
+            selected_devices = [d for d in self.devices if d.id in device_ids]
+            if not selected_devices:
+                raise BusinessError("未选中任何有效设备")
+        else:
+            selected_devices = self._filter_devices_for_inventory(
+                category, status_filter, keyword
+            )
+            if not selected_devices:
+                raise BusinessError("当前筛选条件下没有符合条件的设备")
+
+        items: List[InventoryItem] = []
+        for dev in selected_devices:
+            items.append(InventoryItem(
+                device_id=dev.id,
+                device_name=dev.name,
+                original_status=dev.status,
+            ))
+
+        filter_conditions = {
+            "title": title.strip(),
+            "category": category or "",
+            "status_filter": status_filter or "all",
+            "keyword": keyword or "",
+            "manual_device_count": len(device_ids) if device_ids else 0,
+            "total_devices": len(selected_devices),
+        }
+
+        session = InventorySession(
+            title=title.strip(),
+            status=InventoryStatus.DRAFT,
+            created_by=self.current_user.username if self.current_user else "",
+            created_by_role=self.current_user.role if self.current_user else "",
+            filter_conditions=filter_conditions,
+            items=items,
+            remark=remark.strip() if remark else "",
+        )
+        self.inventory_sessions.append(session)
+        self.save_all()
+        return session
+
+    def get_inventory_sessions(self) -> List[InventorySession]:
+        if not self.current_user:
+            return []
+        if self.current_user.role == UserRole.BORROWER:
+            self._require_permission("view_own_inventory")
+            borrower_name = self.current_user.display_name
+            borrower_id = self.current_user.username
+            visible: List[InventorySession] = []
+            for s in self.inventory_sessions:
+                if s.status != InventoryStatus.COMPLETED:
+                    continue
+                related_items = [it for it in s.items
+                                 if self._is_item_related_to_borrower(
+                                     it, borrower_name, borrower_id)]
+                if related_items:
+                    filtered_session = InventorySession(
+                        id=s.id, title=s.title, status=s.status,
+                        created_by=s.created_by, created_by_role=s.created_by_role,
+                        created_at=s.created_at, completed_at=s.completed_at,
+                        completed_by=s.completed_by, completed_by_role=s.completed_by_role,
+                        filter_conditions=s.filter_conditions,
+                        items=related_items,
+                        remark=s.remark,
+                    )
+                    visible.append(filtered_session)
+            return visible
+        self._require_permission("view_inventory")
+        return list(self.inventory_sessions)
+
+    def _is_item_related_to_borrower(self, item: InventoryItem,
+                                      borrower_name: str,
+                                      borrower_id: str) -> bool:
+        for r in self.records:
+            if (r.device_id == item.device_id
+                    and (r.borrower_name == borrower_name
+                         or r.borrower_id == borrower_id)):
+                return True
+        return False
+
+    def _find_inventory_item(self, session: InventorySession,
+                              device_id: str) -> Optional[InventoryItem]:
+        return next((it for it in session.items if it.device_id == device_id), None)
+
+    def fill_inventory_item(self, session_id: str, device_id: str,
+                            actual_status: str = "", actual_location: str = "",
+                            missing_accessories: Optional[List[str]] = None,
+                            inventory_result: str = "",
+                            remark: str = "") -> InventoryItem:
+        self._require_permission("fill_inventory")
+        session = self.find_inventory_session(session_id)
+        if not session:
+            raise BusinessError("盘点记录不存在")
+        if session.status == InventoryStatus.COMPLETED:
+            raise BusinessError("该盘点已完成，不能再填写")
+        item = self._find_inventory_item(session, device_id)
+        if not item:
+            raise BusinessError("该设备不在本次盘点范围内")
+
+        has_conflict, conflict_msg = self._has_device_active_business(device_id)
+        if has_conflict and inventory_result and inventory_result != InventoryItemResult.NORMAL:
+            if actual_status and actual_status != item.original_status:
+                raise BusinessError(
+                    f"{conflict_msg}，盘点中不能覆盖正在进行的业务状态。"
+                    f"请保持实际状态与系统原状态一致，或先完成相关业务流程再盘点。"
+                )
+
+        item.actual_status = actual_status.strip() if actual_status else item.original_status
+        item.actual_location = actual_location.strip() if actual_location else ""
+        item.missing_accessories = list(missing_accessories) if missing_accessories else []
+        if inventory_result and inventory_result in InventoryItemResult.ALL_RESULTS:
+            item.inventory_result = inventory_result
+        elif missing_accessories and len(missing_accessories) > 0:
+            item.inventory_result = InventoryItemResult.ACCESSORY_MISSING
+        elif actual_status and actual_status != item.original_status:
+            item.inventory_result = InventoryItemResult.OTHER
+        elif not item.inventory_result:
+            item.inventory_result = InventoryItemResult.NORMAL
+        item.remark = remark.strip() if remark else item.remark
+        item.filled_by = self.current_user.username if self.current_user else ""
+        item.filled_by_role = self.current_user.role if self.current_user else ""
+        item.filled_at = _now_str()
+
+        if session.status == InventoryStatus.DRAFT:
+            session.status = InventoryStatus.IN_PROGRESS
+
+        self.save_all()
+        return item
+
+    def complete_inventory(self, session_id: str,
+                           remark: str = "") -> InventorySession:
+        self._require_permission("complete_inventory")
+        session = self.find_inventory_session(session_id)
+        if not session:
+            raise BusinessError("盘点记录不存在")
+        if session.status == InventoryStatus.COMPLETED:
+            raise BusinessError("该盘点已经完成")
+        if not session.items:
+            raise BusinessError("盘点没有包含任何设备，无法完成")
+
+        unfilled = [it for it in session.items if not it.inventory_result]
+        if unfilled:
+            raise BusinessError(
+                f"还有 {len(unfilled)} 台设备未填写盘点结果，"
+                f"请全部填写后再完成盘点。"
+            )
+
+        session.status = InventoryStatus.COMPLETED
+        session.completed_at = _now_str()
+        session.completed_by = self.current_user.username if self.current_user else ""
+        session.completed_by_role = self.current_user.role if self.current_user else ""
+        if remark and remark.strip():
+            session.remark = (session.remark + "\n" if session.remark else "") + remark.strip()
+
+        self.save_all()
+        return session
+
+    def get_inventory_exception_count(self, session: InventorySession) -> int:
+        return sum(1 for it in session.items
+                   if it.inventory_result
+                   and it.inventory_result != InventoryItemResult.NORMAL)
+
+    def export_inventory_session(self, session_id: str,
+                                  filepath: str) -> Tuple[bool, str]:
+        self._require_permission("export_inventory")
+        session = self.find_inventory_session(session_id)
+        if not session:
+            return False, "盘点记录不存在"
+        if session.status != InventoryStatus.COMPLETED:
+            return False, "只有已完成的盘点才能导出"
+
+        ok, reason = self.check_export_dir_detail()
+        if not ok:
+            return False, f"导出失败：{reason}\n请先设置一个可写的导出目录。"
+
+        operator = self.current_user.username if self.current_user else ""
+        exception_count = self.get_inventory_exception_count(session)
+
+        if filepath.lower().endswith(".csv"):
+            ok = storage.export_inventory_csv(session, filepath, operator, exception_count)
+        else:
+            ok = storage.export_inventory_json(session, filepath, operator, exception_count)
+        if not ok:
+            return False, f"导出失败，目标文件无法写入：{filepath}"
+        return True, f"导出成功：{filepath}"
+
+    def save_inventory_filter(self, flt: dict):
+        try:
+            self.config.last_inventory_filter = dict(flt) if flt else {}
+            self.save_all()
+        except Exception:
+            pass
+
+    def get_last_inventory_filter(self) -> dict:
+        return dict(self.config.last_inventory_filter or {})
