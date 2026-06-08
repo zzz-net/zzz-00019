@@ -2,9 +2,11 @@ import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from typing import List, Optional
+from datetime import datetime, timedelta
 from models import (
     Device, Borrower, BorrowRecord, Accessory,
-    DeviceStatus, RecordStatus, UserRole, User, _now_str
+    DeviceStatus, RecordStatus, UserRole, User, _now_str,
+    MaintenanceRecord
 )
 from business import EquipmentManager, BusinessError
 
@@ -14,10 +16,17 @@ STATUS_COLORS = {
     DeviceStatus.BORROWED: "#e67e22",
     DeviceStatus.FROZEN: "#c0392b",
     DeviceStatus.INSPECTING: "#2980b9",
+    DeviceStatus.MAINTENANCE: "#8e44ad",
     RecordStatus.BORROWED: "#e67e22",
     RecordStatus.INSPECTING: "#2980b9",
     RecordStatus.RETURNED: "#27ae60",
     RecordStatus.FROZEN: "#c0392b",
+}
+
+MAINTENANCE_STATUS_LABELS = {
+    "all": "全部",
+    "in_progress": "进行中",
+    "cancelled": "已撤销",
 }
 
 ALERT_OVERDUE_COLOR = "#c0392b"
@@ -475,6 +484,128 @@ class InspectDialog(tk.Toplevel):
             self._do_inspect(True)
 
 
+class MaintenanceDialog(tk.Toplevel):
+    def __init__(self, master, manager: EquipmentManager, device: Device):
+        super().__init__(master)
+        self.title(f"送修/保养登记 - {device.name}")
+        self.geometry("520x380")
+        self.resizable(False, False)
+        self.manager = manager
+        self.device = device
+        self.result = None
+        self._build()
+        self.grab_set()
+        self.transient(master)
+
+    def _build(self):
+        main = ttk.Frame(self, padding=12)
+        main.pack(fill="both", expand=True)
+
+        info_frame = ttk.LabelFrame(main, text="设备信息", padding=8)
+        info_frame.pack(fill="x", pady=(0, 8))
+        ttk.Label(info_frame, text=f"名称: {self.device.name}").grid(row=0, column=0, sticky="w")
+        ttk.Label(info_frame, text=f"当前状态: {self.device.status}",
+                  foreground=STATUS_COLORS.get(self.device.status, "#000")).grid(
+            row=0, column=1, sticky="w", padx=20)
+        ttk.Label(info_frame, text=f"型号: {self.device.model or '-'}").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Label(info_frame, text=f"序列号: {self.device.serial_no or '-'}").grid(
+            row=1, column=1, sticky="w", padx=20, pady=2)
+
+        ttk.Label(main, text="维修/保养原因 *:").pack(anchor="w")
+        self.reason_text = tk.Text(main, width=55, height=4)
+        self.reason_text.pack(fill="x", pady=(2, 8))
+
+        default_days = self.manager.get_default_maintenance_days()
+        default_dt = (datetime.now() + timedelta(days=default_days)).strftime("%Y-%m-%d %H:%M:%S")
+        ttk.Label(main, text=f"预计恢复时间 (YYYY-MM-DD HH:MM:SS，默认 {default_days} 天后):").pack(anchor="w")
+        self.exp_time_var = tk.StringVar(value=default_dt)
+        ttk.Entry(main, textvariable=self.exp_time_var, width=55).pack(fill="x", pady=(2, 8))
+
+        ttk.Label(main, text=f"经办人: {self.manager.current_user.display_name if self.manager.current_user else '-'} "
+                             f"({self.manager.current_user.role if self.manager.current_user else ''})").pack(anchor="w")
+
+        btns = ttk.Frame(main)
+        btns.pack(pady=(12, 0))
+        ttk.Button(btns, text="确认送修", command=self._ok).pack(side="left", padx=6)
+        ttk.Button(btns, text="取消", command=self.destroy).pack(side="left", padx=6)
+
+    def _ok(self):
+        reason = self.reason_text.get("1.0", "end").strip()
+        if not reason:
+            messagebox.showerror("错误", "请填写维修/保养原因", parent=self)
+            return
+        try:
+            rec, msg = self.manager.send_to_maintenance(
+                device_id=self.device.id,
+                reason=reason,
+                expected_recover_time=self.exp_time_var.get().strip(),
+            )
+            self.result = rec
+            messagebox.showinfo("成功", msg, parent=self)
+            self.destroy()
+        except BusinessError as e:
+            messagebox.showerror("送修失败", str(e), parent=self)
+
+
+class CancelMaintenanceDialog(tk.Toplevel):
+    def __init__(self, master, manager: EquipmentManager, device: Device):
+        super().__init__(master)
+        self.title(f"撤销维修登记 - {device.name}")
+        self.geometry("480x260")
+        self.resizable(False, False)
+        self.manager = manager
+        self.device = device
+        self.result = None
+        self._build()
+        self.grab_set()
+        self.transient(master)
+
+    def _build(self):
+        main = ttk.Frame(self, padding=12)
+        main.pack(fill="both", expand=True)
+
+        active_m = self.manager.get_active_maintenance_for_device(self.device.id)
+        info_frame = ttk.LabelFrame(main, text="当前维修信息", padding=8)
+        info_frame.pack(fill="x", pady=(0, 8))
+        ttk.Label(info_frame, text=f"设备: {self.device.name}").grid(row=0, column=0, sticky="w")
+        ttk.Label(info_frame, text=f"送修前状态: {active_m.from_status if active_m else '-'}").grid(
+            row=0, column=1, sticky="w", padx=20)
+        if active_m:
+            ttk.Label(info_frame, text=f"原因: {active_m.reason[:40]}").grid(row=1, column=0, sticky="w", pady=2, columnspan=2)
+            ttk.Label(info_frame, text=f"送修时间: {active_m.start_time}").grid(row=2, column=0, sticky="w", pady=2)
+            ttk.Label(info_frame, text=f"经办人: {active_m.operator}").grid(row=2, column=1, sticky="w", padx=20, pady=2)
+
+        can, reason = self.manager.can_cancel_maintenance(self.device.id)
+        if not can:
+            tip = ttk.Label(main, text=f"⚠ 无法撤销：{reason}", foreground="#c0392b")
+            tip.pack(anchor="w", pady=(0, 8))
+
+        ttk.Label(main, text="撤销说明:").pack(anchor="w")
+        self.remark_text = tk.Text(main, width=52, height=3)
+        self.remark_text.pack(fill="x", pady=(2, 8))
+
+        btns = ttk.Frame(main)
+        btns.pack(pady=(8, 0))
+        ok_btn = ttk.Button(btns, text="确认撤销", command=self._ok)
+        if not can:
+            ok_btn.config(state="disabled")
+        ok_btn.pack(side="left", padx=6)
+        ttk.Button(btns, text="取消", command=self.destroy).pack(side="left", padx=6)
+
+    def _ok(self):
+        remark = self.remark_text.get("1.0", "end").strip()
+        try:
+            rec, msg = self.manager.cancel_last_maintenance(
+                device_id=self.device.id,
+                remark=remark,
+            )
+            self.result = rec
+            messagebox.showinfo("成功", msg, parent=self)
+            self.destroy()
+        except BusinessError as e:
+            messagebox.showerror("撤销失败", str(e), parent=self)
+
+
 class HistoryDialog(tk.Toplevel):
     def __init__(self, master, record: BorrowRecord):
         super().__init__(master)
@@ -484,7 +615,6 @@ class HistoryDialog(tk.Toplevel):
         self._build(record)
         self.grab_set()
         self.transient(master)
-
     def _build(self, record: BorrowRecord):
         main = ttk.Frame(self, padding=12)
         main.pack(fill="both", expand=True)
@@ -542,6 +672,11 @@ class App:
         self._selected_record_id: Optional[str] = None
         self._current_alert_filter: str = "all"
         self._preserved_record_selection: List[str] = []
+        self._selected_maintenance_ids: List[str] = []
+        self._maint_filter_device: str = ""
+        self._maint_filter_status: str = "all"
+        self._maint_filter_start_from: str = ""
+        self._maint_filter_start_to: str = ""
         self._build_ui()
         self._refresh_all()
 
@@ -611,6 +746,10 @@ class App:
         self.btn_freeze_device.pack(side="left", padx=2)
         self.btn_unfreeze_device = ttk.Button(btns, text="解冻", command=self._unfreeze_device)
         self.btn_unfreeze_device.pack(side="left", padx=2)
+        self.btn_send_maintenance = ttk.Button(btns, text="送修/保养", command=self._send_to_maintenance)
+        self.btn_send_maintenance.pack(side="left", padx=2)
+        self.btn_cancel_maintenance = ttk.Button(btns, text="撤销送修", command=self._cancel_maintenance)
+        self.btn_cancel_maintenance.pack(side="left", padx=2)
         self.btn_export_devices = ttk.Button(btns, text="导出", command=self._export_devices)
         self.btn_export_devices.pack(side="right", padx=2)
 
@@ -642,6 +781,9 @@ class App:
                                        foreground=STATUS_COLORS[DeviceStatus.FROZEN])
         self.device_tree.tag_configure(DeviceStatus.INSPECTING,
                                        foreground=STATUS_COLORS[DeviceStatus.INSPECTING])
+        self.device_tree.tag_configure(DeviceStatus.MAINTENANCE,
+                                       foreground=STATUS_COLORS[DeviceStatus.MAINTENANCE],
+                                       background="#f4ecf7")
 
         self.device_detail = tk.Text(frame, height=7, state="disabled", wrap="word")
         self.device_detail.pack(fill="x", pady=(6, 0))
@@ -665,6 +807,81 @@ class App:
         self.borrower_tree.column("department", width=140, anchor="w")
         self.borrower_tree.column("phone", width=140, anchor="w")
         self.borrower_tree.pack(fill="x")
+
+        self._build_maintenance_panel(parent)
+
+    def _build_maintenance_panel(self, parent):
+        maint_frame = ttk.LabelFrame(parent, text="维修/保养记录", padding=6)
+        maint_frame.pack(fill="both", expand=True, pady=(8, 0))
+
+        filter_row = ttk.Frame(maint_frame)
+        filter_row.pack(fill="x", pady=(0, 4))
+
+        ttk.Label(filter_row, text="设备ID:").pack(side="left", padx=(0, 2))
+        self.maint_device_var = tk.StringVar()
+        ttk.Entry(filter_row, textvariable=self.maint_device_var, width=12).pack(side="left", padx=(0, 6))
+
+        ttk.Label(filter_row, text="状态:").pack(side="left", padx=(0, 2))
+        self.maint_status_var = tk.StringVar(value=MAINTENANCE_STATUS_LABELS["all"])
+        maint_status_combo = ttk.Combobox(
+            filter_row, textvariable=self.maint_status_var, width=8, state="readonly",
+            values=list(MAINTENANCE_STATUS_LABELS.values())
+        )
+        maint_status_combo.pack(side="left", padx=(0, 6))
+
+        ttk.Label(filter_row, text="开始时间起:").pack(side="left", padx=(0, 2))
+        self.maint_from_var = tk.StringVar()
+        ttk.Entry(filter_row, textvariable=self.maint_from_var, width=16).pack(side="left", padx=(0, 6))
+
+        ttk.Label(filter_row, text="至:").pack(side="left", padx=(0, 2))
+        self.maint_to_var = tk.StringVar()
+        ttk.Entry(filter_row, textvariable=self.maint_to_var, width=16).pack(side="left", padx=(0, 6))
+
+        self.btn_maint_apply = ttk.Button(filter_row, text="应用筛选",
+                                          command=self._on_maint_filter_apply)
+        self.btn_maint_apply.pack(side="left", padx=2)
+        self.btn_maint_reset = ttk.Button(filter_row, text="重置",
+                                          command=self._on_maint_filter_reset)
+        self.btn_maint_reset.pack(side="left", padx=2)
+        self.btn_maint_export = ttk.Button(filter_row, text="导出选中",
+                                           command=self._export_maintenance_logs)
+        self.btn_maint_export.pack(side="right", padx=2)
+
+        self.maint_status_label = ttk.Label(filter_row, text="", foreground="#2980b9")
+        self.maint_status_label.pack(side="right", padx=6)
+
+        mtree_frame = ttk.Frame(maint_frame)
+        mtree_frame.pack(fill="both", expand=True)
+        mcols = ("id", "device", "device_name", "from_status", "reason",
+                 "exp_recover", "start_time", "status", "operator")
+        self.maint_tree = ttk.Treeview(mtree_frame, columns=mcols,
+                                       show="headings", height=7, selectmode="extended")
+        self.maint_tree.heading("id", text="记录ID")
+        self.maint_tree.heading("device", text="设备ID")
+        self.maint_tree.heading("device_name", text="设备名称")
+        self.maint_tree.heading("from_status", text="送修前状态")
+        self.maint_tree.heading("reason", text="维修原因")
+        self.maint_tree.heading("exp_recover", text="预计恢复")
+        self.maint_tree.heading("start_time", text="送修时间")
+        self.maint_tree.heading("status", text="状态")
+        self.maint_tree.heading("operator", text="经办人")
+        self.maint_tree.column("id", width=80, anchor="center")
+        self.maint_tree.column("device", width=80, anchor="center")
+        self.maint_tree.column("device_name", width=150, anchor="w")
+        self.maint_tree.column("from_status", width=80, anchor="center")
+        self.maint_tree.column("reason", width=160, anchor="w")
+        self.maint_tree.column("exp_recover", width=130, anchor="w")
+        self.maint_tree.column("start_time", width=140, anchor="w")
+        self.maint_tree.column("status", width=70, anchor="center")
+        self.maint_tree.column("operator", width=80, anchor="w")
+        mvsb = ttk.Scrollbar(mtree_frame, orient="vertical", command=self.maint_tree.yview)
+        self.maint_tree.configure(yscrollcommand=mvsb.set)
+        self.maint_tree.pack(side="left", fill="both", expand=True)
+        mvsb.pack(side="right", fill="y")
+        self.maint_tree.bind("<<TreeviewSelect>>", self._on_maint_selected)
+
+        self.maint_tree.tag_configure("in_progress", foreground=STATUS_COLORS[DeviceStatus.MAINTENANCE])
+        self.maint_tree.tag_configure("cancelled", foreground="#7f8c8d")
 
     def _build_records_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="借用记录", padding=6)
@@ -757,9 +974,24 @@ class App:
         self._refresh_user_combo()
         self._refresh_devices()
         self._refresh_borrowers()
+        self._restore_last_maintenance_filter()
         self._refresh_records()
+        self._refresh_maintenance_logs()
         self._refresh_export_dir()
         self._apply_permissions()
+
+    def _restore_last_maintenance_filter(self):
+        saved = self.manager.get_last_maintenance_filter()
+        if saved:
+            self._maint_filter_device = saved.get("device_id", "")
+            self._maint_filter_status = saved.get("status_filter", "all")
+            self._maint_filter_start_from = saved.get("start_from", "")
+            self._maint_filter_start_to = saved.get("start_to", "")
+        self.maint_device_var.set(self._maint_filter_device)
+        status_label = MAINTENANCE_STATUS_LABELS.get(self._maint_filter_status, MAINTENANCE_STATUS_LABELS["all"])
+        self.maint_status_var.set(status_label)
+        self.maint_from_var.set(self._maint_filter_start_from)
+        self.maint_to_var.set(self._maint_filter_start_to)
 
     def _refresh_user_combo(self):
         values = [f"{u.username} ({u.display_name} - {u.role})" for u in self.manager.users]
@@ -910,6 +1142,10 @@ class App:
             "export_data": [self.btn_export_devices, self.btn_export_records],
             "import_records": [self.btn_import_records],
             "set_reminder_days": [self.btn_set_reminder_days, self.reminder_days_entry],
+            "send_to_maintenance": [self.btn_send_maintenance],
+            "cancel_maintenance": [self.btn_cancel_maintenance],
+            "view_maintenance": [self.btn_maint_apply, self.btn_maint_reset],
+            "export_maintenance": [self.btn_maint_export],
         }
         for perm, widgets in perm_map.items():
             enabled = self.manager.has_permission(perm)
@@ -918,6 +1154,14 @@ class App:
                     w.config(state="normal" if enabled else "disabled")
                 else:
                     w.config(state="normal" if enabled else "disabled")
+
+        if not self.manager.has_permission("view_maintenance"):
+            self.maint_device_var.set("")
+            self.maint_status_var.set(MAINTENANCE_STATUS_LABELS["all"])
+            self.maint_from_var.set("")
+            self.maint_to_var.set("")
+            for child in self.maint_tree.winfo_children():
+                child.pack_forget() if hasattr(child, "pack_forget") else None
 
     def _on_user_changed(self, _event=None):
         value = self.user_var.get()
@@ -1068,6 +1312,11 @@ class App:
         if device.status == DeviceStatus.FROZEN:
             messagebox.showerror("错误",
                                  f"设备【{device.name}】处于异常冻结状态，不能借出。")
+            return
+        if device.status == DeviceStatus.MAINTENANCE:
+            messagebox.showerror("错误",
+                                 f"设备【{device.name}】正在维修/保养中，不能借出。\n"
+                                 f"请待维修完成恢复可用后再操作。")
             return
         dlg = BorrowDialog(self.root, self.manager, device)
         self.root.wait_window(dlg)
@@ -1303,6 +1552,185 @@ class App:
                 f"{msg}\n\n"
                 f"所有记录均未写入，设备状态和记录历史保持不变。"
             )
+
+    def _send_to_maintenance(self):
+        if not self._selected_device_id:
+            messagebox.showinfo("提示", "请先在左侧选择要送修/保养的设备")
+            return
+        device = self.manager.find_device(self._selected_device_id)
+        if not device:
+            return
+        if device.status not in (DeviceStatus.AVAILABLE, DeviceStatus.FROZEN):
+            messagebox.showerror("错误",
+                                 f"设备【{device.name}】当前状态为【{device.status}】，\n"
+                                 f"仅【可借出】或【异常冻结】的设备可登记维修/保养。")
+            return
+        dlg = MaintenanceDialog(self.root, self.manager, device)
+        self.root.wait_window(dlg)
+        if dlg.result:
+            self._refresh_devices()
+            self._refresh_maintenance_logs()
+            self.status_var.set(f"设备【{device.name}】已登记为维修/保养")
+
+    def _cancel_maintenance(self):
+        if not self._selected_device_id:
+            messagebox.showinfo("提示", "请先在左侧选择要撤销送修的设备")
+            return
+        device = self.manager.find_device(self._selected_device_id)
+        if not device:
+            return
+        if device.status != DeviceStatus.MAINTENANCE:
+            messagebox.showerror("错误",
+                                 f"设备【{device.name}】当前状态为【{device.status}】，\n"
+                                 f"只有【维修中】的设备可撤销送修。")
+            return
+        dlg = CancelMaintenanceDialog(self.root, self.manager, device)
+        self.root.wait_window(dlg)
+        if dlg.result:
+            self._refresh_devices()
+            self._refresh_maintenance_logs()
+            self.status_var.set(f"设备【{device.name}】的维修登记已撤销")
+
+    def _on_maint_selected(self, _event=None):
+        sel = self.maint_tree.selection()
+        self._selected_maintenance_ids = list(sel)
+
+    def _label_to_maint_status_key(self, label: str) -> str:
+        for k, v in MAINTENANCE_STATUS_LABELS.items():
+            if v == label:
+                return k
+        return "all"
+
+    def _on_maint_filter_apply(self):
+        self._maint_filter_device = self.maint_device_var.get().strip()
+        self._maint_filter_status = self._label_to_maint_status_key(self.maint_status_var.get())
+        self._maint_filter_start_from = self.maint_from_var.get().strip()
+        self._maint_filter_start_to = self.maint_to_var.get().strip()
+        self.manager.save_maintenance_filter({
+            "device_id": self._maint_filter_device,
+            "status_filter": self._maint_filter_status,
+            "start_from": self._maint_filter_start_from,
+            "start_to": self._maint_filter_start_to,
+        })
+        self._refresh_maintenance_logs()
+        self.status_var.set("维修记录筛选已应用")
+
+    def _on_maint_filter_reset(self):
+        self._maint_filter_device = ""
+        self._maint_filter_status = "all"
+        self._maint_filter_start_from = ""
+        self._maint_filter_start_to = ""
+        self.maint_device_var.set("")
+        self.maint_status_var.set(MAINTENANCE_STATUS_LABELS["all"])
+        self.maint_from_var.set("")
+        self.maint_to_var.set("")
+        self.manager.save_maintenance_filter({})
+        self._refresh_maintenance_logs()
+        self.status_var.set("维修记录筛选已重置")
+
+    def _refresh_maintenance_logs(self):
+        if not self.manager.has_permission("view_maintenance"):
+            self.maint_tree.delete(*self.maint_tree.get_children())
+            self.maint_status_label.config(text="【无权限】", foreground="#c0392b")
+            return
+        try:
+            all_logs = self.manager.get_maintenance_logs()
+        except BusinessError:
+            self.maint_tree.delete(*self.maint_tree.get_children())
+            self.maint_status_label.config(text="【无权限】", foreground="#c0392b")
+            return
+        filtered = self.manager.filter_maintenance_logs(
+            all_logs,
+            device_id=self._maint_filter_device,
+            status_filter=self._maint_filter_status,
+            start_from=self._maint_filter_start_from,
+            start_to=self._maint_filter_start_to,
+        )
+        current_selection = list(self.maint_tree.selection())
+        if current_selection:
+            self._selected_maintenance_ids = current_selection
+        self.maint_tree.delete(*self.maint_tree.get_children())
+        visible_ids = set()
+        for m in sorted(filtered, key=lambda x: x.start_time, reverse=True):
+            status_text = "进行中" if m.status == "in_progress" else (
+                "已撤销" if m.status == "cancelled" else m.status
+            )
+            self.maint_tree.insert("", "end", iid=m.id, values=(
+                m.id, m.device_id, m.device_name, m.from_status,
+                (m.reason[:18] + "...") if len(m.reason) > 20 else m.reason,
+                m.expected_recover_time, m.start_time, status_text, m.operator
+            ), tags=(m.status,))
+            visible_ids.add(m.id)
+        to_restore = [mid for mid in self._selected_maintenance_ids if mid in visible_ids]
+        if to_restore:
+            try:
+                self.maint_tree.selection_set(to_restore)
+            except Exception:
+                pass
+        total = len(all_logs)
+        shown = len(filtered)
+        parts = [f"显示 {shown}/{total} 条"]
+        if self._maint_filter_status != "all":
+            parts.append(f"（{MAINTENANCE_STATUS_LABELS[self._maint_filter_status]}）")
+        if self._maint_filter_device:
+            parts.append(f"设备={self._maint_filter_device}")
+        if shown == 0 and (self._maint_filter_status != "all" or self._maint_filter_device
+                            or self._maint_filter_start_from or self._maint_filter_start_to):
+            parts.append("- 该筛选下无记录")
+        self.maint_status_label.config(text="  ".join(parts), foreground="#2980b9")
+
+    def _export_maintenance_logs(self):
+        if not self.manager.has_permission("view_maintenance"):
+            messagebox.showerror("无权限", "当前角色不能查看或导出维修记录。")
+            return
+        sel = self.maint_tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先在维修记录列表中选择要导出的记录（支持多选）")
+            return
+        if not self._check_export_dir():
+            return
+        status_desc = MAINTENANCE_STATUS_LABELS.get(self._maint_filter_status, "全部")
+        default_name = f"维修记录_{status_desc}_{_now_str().replace(':', '-').replace(' ', '_')}"
+        filepath = filedialog.asksaveasfilename(
+            title="导出维修记录",
+            initialdir=self.manager.config.export_dir,
+            initialfile=default_name,
+            defaultextension=".csv",
+            filetypes=[("CSV 表格", "*.csv"), ("JSON 数据", "*.json")]
+        )
+        if not filepath:
+            return
+        if not filepath.startswith(self.manager.config.export_dir):
+            if not messagebox.askyesno("目录不匹配",
+                                       f"所选路径不在设置的导出目录下。\n"
+                                       f"导出目录: {self.manager.config.export_dir}\n"
+                                       f"确定继续导出？"):
+                return
+        filter_info = {
+            "description": f"维修记录（{status_desc}）",
+            "筛选类型": status_desc,
+            "设备ID筛选": self._maint_filter_device or "（未指定）",
+            "时间起": self._maint_filter_start_from or "（未指定）",
+            "时间止": self._maint_filter_start_to or "（未指定）",
+            "默认维修天数": f"{self.manager.get_default_maintenance_days()} 天",
+            "导出时间": _now_str(),
+            "操作人": (f"{self.manager.current_user.display_name} ({self.manager.current_user.username})"
+                       if self.manager.current_user else "unknown"),
+            "角色": self.manager.current_user.role if self.manager.current_user else "unknown",
+            "可见记录数": len(self.manager.filter_maintenance_logs(
+                self.manager.maintenance_logs,
+                device_id=self._maint_filter_device,
+                status_filter=self._maint_filter_status,
+                start_from=self._maint_filter_start_from,
+                start_to=self._maint_filter_start_to,
+            )),
+            "本次选中导出数": len(sel),
+        }
+        ok, msg = self.manager.export_maintenance_logs(list(sel), filepath, filter_info)
+        if ok:
+            messagebox.showinfo("成功", f"{msg}\n\n共导出 {len(sel)} 条维修记录")
+        else:
+            messagebox.showerror("失败", msg)
 
 
 class ImportPrecheckDialog(tk.Toplevel):

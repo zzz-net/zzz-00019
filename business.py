@@ -5,7 +5,7 @@ from typing import List, Optional, Tuple, Dict, Any
 from models import (
     Device, Borrower, BorrowRecord, User, Accessory,
     DeviceStatus, RecordStatus, UserRole, _now_str,
-    ImportPrecheckSummary, ImportLogEntry
+    ImportPrecheckSummary, ImportLogEntry, MaintenanceRecord
 )
 import storage
 
@@ -20,8 +20,10 @@ class EquipmentManager:
         self.borrowers: List[Borrower] = []
         self.records: List[BorrowRecord] = []
         self.users: List[User] = []
+        self.maintenance_logs: List[MaintenanceRecord] = []
         self.config = storage.AppConfig()
         self.current_user: Optional[User] = None
+        self._records_snapshot_at_last_maintenance: Dict[str, str] = {}
         self.load_all()
 
     def load_all(self):
@@ -30,6 +32,7 @@ class EquipmentManager:
         self.borrowers = storage.load_borrowers()
         self.records = storage.load_records()
         self.users = storage.load_users()
+        self.maintenance_logs = storage.load_maintenance_logs()
         self.config = storage.load_config()
         if self.config.last_user:
             self.current_user = self.find_user(self.config.last_user)
@@ -39,6 +42,7 @@ class EquipmentManager:
         storage.save_borrowers(self.borrowers)
         storage.save_records(self.records)
         storage.save_users(self.users)
+        storage.save_maintenance_logs(self.maintenance_logs)
         storage.save_config(self.config)
 
     def find_user(self, username: str) -> Optional[User]:
@@ -114,6 +118,11 @@ class EquipmentManager:
         active = self.get_active_record_for_device(device_id)
         if active:
             raise BusinessError("该设备存在进行中的借用记录，无法删除")
+        if device.status == DeviceStatus.MAINTENANCE:
+            raise BusinessError(
+                f"设备【{device.name}】正在维修/保养中，无法删除。"
+                f"请先撤销维修登记或待维修完成。"
+            )
         self.devices.remove(device)
         self.save_all()
 
@@ -150,6 +159,11 @@ class EquipmentManager:
         if device.status == DeviceStatus.FROZEN:
             raise BusinessError(
                 f"设备【{device.name}】处于异常冻结状态，不能借出。"
+            )
+        if device.status == DeviceStatus.MAINTENANCE:
+            raise BusinessError(
+                f"设备【{device.name}】正在维修/保养中，不能借出。"
+                f"请待维修完成恢复可用后再操作。"
             )
 
         missing_required = []
@@ -546,6 +560,16 @@ class EquipmentManager:
                         f"已有进行中的借用记录"
                     ))
 
+            if device and device.status == DeviceStatus.MAINTENANCE:
+                row_status = str(row.get("status", "")).strip() or RecordStatus.BORROWED
+                if row_status in (RecordStatus.BORROWED, RecordStatus.INSPECTING):
+                    summary.device_status_conflict += 1
+                    issues_for_row.append(self._make_row_issue(
+                        row, "设备状态冲突",
+                        f"设备【{device.name}】当前为【维修中】，"
+                        f"不能导入为【{row_status}】状态"
+                    ))
+
             dup_key = None
             if device and borrower:
                 dup_key = (device.id, borrower.id, str(row.get("borrow_time", "")).strip())
@@ -672,6 +696,14 @@ class EquipmentManager:
                     continue
 
                 status_str = str(row.get("status", "")).strip() or RecordStatus.BORROWED
+
+                if device_state.get(device.id) == DeviceStatus.MAINTENANCE:
+                    if status_str in (RecordStatus.BORROWED, RecordStatus.INSPECTING):
+                        fail_count += 1
+                        fail_reasons.append(
+                            f"第{row.get('_row','?')}行: 设备【{device.name}】维修中，不能导入为借出中/验收中"
+                        )
+                        continue
                 valid_statuses = [RecordStatus.BORROWED, RecordStatus.INSPECTING,
                                   RecordStatus.RETURNED, RecordStatus.FROZEN]
                 if status_str not in valid_statuses:
@@ -765,3 +797,171 @@ class EquipmentManager:
             "last_import_format": self.config.last_import_format,
             "last_import_summary": self.config.last_import_summary,
         }
+
+    def _make_records_snapshot(self) -> Dict[str, str]:
+        snap = {}
+        for r in self.records:
+            snap[r.id] = r.status + "|" + (r.actual_return_time or "")
+        return snap
+
+    def send_to_maintenance(self, device_id: str, reason: str,
+                            expected_recover_time: str = "") -> Tuple[MaintenanceRecord, str]:
+        self._require_permission("send_to_maintenance")
+        device = self.find_device(device_id)
+        if not device:
+            raise BusinessError("设备不存在")
+        if device.status not in (DeviceStatus.AVAILABLE, DeviceStatus.FROZEN):
+            raise BusinessError(
+                f"设备【{device.name}】当前状态为【{device.status}】，"
+                f"仅【可借出】或【异常冻结】的设备可登记维修/保养。"
+            )
+        active = self.get_active_record_for_device(device_id)
+        if active:
+            raise BusinessError(
+                f"设备【{device.name}】存在进行中的借用记录（状态：{active.status}），"
+                f"不能登记维修。请先完成归还流程。"
+            )
+        if not reason or not str(reason).strip():
+            raise BusinessError("请填写维修/保养原因")
+
+        from_status = device.status
+        device.status = DeviceStatus.MAINTENANCE
+        device.remark = (device.remark + "\n" if device.remark else "") + \
+                        f"[{_now_str()}] 送修/保养：{reason.strip()}"
+
+        rec = MaintenanceRecord(
+            device_id=device.id,
+            device_name=device.name,
+            from_status=from_status,
+            reason=reason.strip(),
+            expected_recover_time=expected_recover_time.strip() if expected_recover_time else "",
+            operator=self.current_user.username if self.current_user else "",
+            operator_role=self.current_user.role if self.current_user else "",
+            status="in_progress",
+        )
+        self.maintenance_logs.append(rec)
+        self._records_snapshot_at_last_maintenance = self._make_records_snapshot()
+        self.save_all()
+        return rec, f"设备【{device.name}】已登记为维修/保养（原因：{reason.strip()}）"
+
+    def get_active_maintenance_for_device(self, device_id: str) -> Optional[MaintenanceRecord]:
+        for m in reversed(self.maintenance_logs):
+            if m.device_id == device_id and m.status == "in_progress":
+                return m
+        return None
+
+    def can_cancel_maintenance(self, device_id: str) -> Tuple[bool, str]:
+        active_m = self.get_active_maintenance_for_device(device_id)
+        if not active_m:
+            return False, "该设备没有进行中的维修登记"
+        current_snap = self._make_records_snapshot()
+        if self._records_snapshot_at_last_maintenance and \
+                self._records_snapshot_at_last_maintenance != current_snap:
+            return False, "送修登记后已有借用/归还记录发生变化，无法撤销"
+        return True, ""
+
+    def cancel_last_maintenance(self, device_id: str, remark: str = "") -> Tuple[MaintenanceRecord, str]:
+        self._require_permission("cancel_maintenance")
+        device = self.find_device(device_id)
+        if not device:
+            raise BusinessError("设备不存在")
+        can, reason = self.can_cancel_maintenance(device_id)
+        if not can:
+            raise BusinessError(f"无法撤销维修登记：{reason}")
+        active_m = self.get_active_maintenance_for_device(device_id)
+        if not active_m:
+            raise BusinessError("该设备没有进行中的维修登记")
+        if device.status != DeviceStatus.MAINTENANCE:
+            raise BusinessError(f"设备当前状态为【{device.status}】，不是维修中，无法撤销")
+
+        recover_to = active_m.from_status or DeviceStatus.AVAILABLE
+        if recover_to not in (DeviceStatus.AVAILABLE, DeviceStatus.FROZEN):
+            recover_to = DeviceStatus.AVAILABLE
+        device.status = recover_to
+        device.remark = (device.remark + "\n" if device.remark else "") + \
+                        f"[{_now_str()}] 撤销维修：{remark.strip() if remark else '未说明'}"
+
+        active_m.status = "cancelled"
+        active_m.end_time = _now_str()
+        active_m.cancel_remark = remark.strip() if remark else ""
+        self.save_all()
+        return active_m, f"已撤销维修登记，设备恢复为【{recover_to}】"
+
+    def get_maintenance_logs(self) -> List[MaintenanceRecord]:
+        self._require_permission("view_maintenance")
+        return list(self.maintenance_logs)
+
+    def filter_maintenance_logs(self,
+                                logs: List[MaintenanceRecord],
+                                device_id: str = "",
+                                status_filter: str = "all",
+                                start_from: str = "",
+                                start_to: str = "") -> List[MaintenanceRecord]:
+        result = list(logs)
+        if device_id and device_id.strip():
+            did = device_id.strip()
+            result = [m for m in result if m.device_id == did]
+        if status_filter and status_filter != "all":
+            if status_filter == "in_progress":
+                result = [m for m in result if m.status == "in_progress"]
+            elif status_filter == "cancelled":
+                result = [m for m in result if m.status == "cancelled"]
+        if start_from and start_from.strip():
+            dt_from = self._parse_datetime(start_from.strip())
+            if dt_from:
+                result = [m for m in result
+                          if self._parse_datetime(m.start_time)
+                          and self._parse_datetime(m.start_time) >= dt_from]
+        if start_to and start_to.strip():
+            dt_to = self._parse_datetime(start_to.strip())
+            if dt_to:
+                result = [m for m in result
+                          if self._parse_datetime(m.start_time)
+                          and self._parse_datetime(m.start_time) <= dt_to]
+        return result
+
+    def export_maintenance_logs(self, log_ids: List[str],
+                                filepath: str,
+                                filter_info: Optional[dict] = None) -> Tuple[bool, str]:
+        self._require_permission("export_maintenance")
+        ok, reason = self.check_export_dir_detail()
+        if not ok:
+            return False, (
+                f"导出失败：{reason}\n"
+                f"请先设置一个可写的导出目录。"
+            )
+        selected = [m for m in self.maintenance_logs if m.id in log_ids]
+        if filepath.lower().endswith(".csv"):
+            ok = storage.export_maintenance_csv(selected, filepath, filter_info)
+        else:
+            ok = storage.export_maintenance_json(selected, filepath, filter_info)
+        if not ok:
+            return False, f"导出失败，目标文件无法写入：{filepath}"
+        return True, f"导出成功：{filepath}"
+
+    def set_default_maintenance_days(self, days: int) -> Tuple[bool, str]:
+        self._require_permission("send_to_maintenance")
+        try:
+            days_int = int(days)
+        except (ValueError, TypeError):
+            return False, "默认维修天数必须是正整数"
+        if days_int <= 0:
+            return False, "默认维修天数必须大于 0"
+        if days_int > 365:
+            return False, "默认维修天数不能超过 365 天"
+        self.config.default_maintenance_days = days_int
+        self.save_all()
+        return True, f"默认维修天数已设置为 {days_int} 天"
+
+    def get_default_maintenance_days(self) -> int:
+        return self.config.default_maintenance_days
+
+    def save_maintenance_filter(self, flt: dict):
+        try:
+            self.config.last_maintenance_filter = dict(flt) if flt else {}
+            self.save_all()
+        except Exception:
+            pass
+
+    def get_last_maintenance_filter(self) -> dict:
+        return dict(self.config.last_maintenance_filter or {})

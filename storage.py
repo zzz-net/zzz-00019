@@ -6,7 +6,7 @@ from typing import List, Optional, Tuple, Dict
 from models import (
     Device, Borrower, BorrowRecord, User, AppConfig,
     DeviceStatus, RecordStatus, UserRole, Accessory, _now_str,
-    ImportPrecheckSummary, ImportLogEntry
+    ImportPrecheckSummary, ImportLogEntry, MaintenanceRecord
 )
 
 
@@ -17,6 +17,7 @@ RECORDS_FILE = os.path.join(DATA_DIR, "records.json")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 IMPORT_LOGS_FILE = os.path.join(DATA_DIR, "import_logs.json")
+MAINTENANCE_LOGS_FILE = os.path.join(DATA_DIR, "maintenance_logs.json")
 
 
 IMPORT_REQUIRED_FIELDS = [
@@ -374,3 +375,63 @@ def parse_import_file(filepath: str) -> Tuple[bool, str, List[dict], str]:
         return ok, msg, rows, "json"
     else:
         return False, f"不支持的文件格式：{ext}（仅支持 .csv 和 .json）", [], ext
+
+
+def save_maintenance_logs(logs: List[MaintenanceRecord]):
+    _save_json(MAINTENANCE_LOGS_FILE, [l.to_dict() for l in logs])
+
+
+def load_maintenance_logs() -> List[MaintenanceRecord]:
+    data = _load_json(MAINTENANCE_LOGS_FILE, [])
+    return [MaintenanceRecord.from_dict(d) for d in data]
+
+
+def append_maintenance_log(entry: MaintenanceRecord):
+    logs = load_maintenance_logs()
+    logs.append(entry)
+    save_maintenance_logs(logs)
+
+
+def export_maintenance_csv(logs: List[MaintenanceRecord], filepath: str,
+                           filter_info: Optional[dict] = None) -> bool:
+    try:
+        with open(filepath, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            if filter_info:
+                writer.writerow([f"# 导出筛选条件: {filter_info.get('description', '')}"])
+                for k, v in filter_info.items():
+                    if k != "description":
+                        writer.writerow([f"# {k}: {v}"])
+            writer.writerow([
+                "维修记录ID", "设备ID", "设备名称", "送修前状态",
+                "维修原因", "预计恢复时间", "经办人", "经办人角色",
+                "送修时间", "结束时间", "状态", "撤销说明"
+            ])
+            for m in logs:
+                status_text = "进行中" if m.status == "in_progress" else (
+                    "已撤销" if m.status == "cancelled" else m.status
+                )
+                writer.writerow([
+                    m.id, m.device_id, m.device_name, m.from_status,
+                    m.reason, m.expected_recover_time, m.operator, m.operator_role,
+                    m.start_time, m.end_time, status_text, m.cancel_remark
+                ])
+        return True
+    except (IOError, OSError):
+        return False
+
+
+def export_maintenance_json(logs: List[MaintenanceRecord], filepath: str,
+                            filter_info: Optional[dict] = None) -> bool:
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            data = {
+                "export_time": _now_str(),
+                "records": [m.to_dict() for m in logs],
+            }
+            if filter_info:
+                data["filter_info"] = dict(filter_info)
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except (IOError, OSError):
+        return False

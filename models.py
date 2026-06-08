@@ -18,6 +18,7 @@ class DeviceStatus:
     BORROWED = "已借出"
     FROZEN = "异常冻结"
     INSPECTING = "验收中"
+    MAINTENANCE = "维修中"
 
 
 class RecordStatus:
@@ -39,11 +40,14 @@ class UserRole:
                 "add_borrower", "borrow_device", "return_device",
                 "inspect_return", "freeze_device", "unfreeze_device",
                 "close_record", "export_data", "import_records", "view_all",
-                "set_reminder_days"],
+                "set_reminder_days",
+                "send_to_maintenance", "cancel_maintenance",
+                "view_maintenance", "export_maintenance"],
         BORROWER: ["borrow_device", "view_own", "export_data"],
         INSPECTOR: ["inspect_return", "return_device", "close_record",
                     "view_all", "export_data", "import_records",
-                    "set_reminder_days"],
+                    "set_reminder_days",
+                    "view_maintenance", "export_maintenance"],
     }
 
     @classmethod
@@ -226,6 +230,29 @@ class ImportLogEntry:
 
 
 @dataclass
+class MaintenanceRecord:
+    id: str = field(default_factory=_new_id)
+    device_id: str = ""
+    device_name: str = ""
+    from_status: str = ""
+    reason: str = ""
+    expected_recover_time: str = ""
+    operator: str = ""
+    operator_role: str = ""
+    start_time: str = field(default_factory=_now_str)
+    end_time: str = ""
+    status: str = "in_progress"
+    cancel_remark: str = ""
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict):
+        return cls(**d)
+
+
+@dataclass
 class AppConfig:
     export_dir: str = ""
     last_user: str = ""
@@ -233,6 +260,8 @@ class AppConfig:
     last_import_format: str = ""
     last_import_summary: dict = field(default_factory=dict)
     reminder_days: int = 3
+    default_maintenance_days: int = 7
+    last_maintenance_filter: dict = field(default_factory=dict)
 
     def to_dict(self):
         return asdict(self)

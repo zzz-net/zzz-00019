@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models import (
     Device, Borrower, BorrowRecord, Accessory, User, AppConfig,
-    DeviceStatus, RecordStatus, UserRole
+    DeviceStatus, RecordStatus, UserRole, MaintenanceRecord
 )
 from business import EquipmentManager, BusinessError
 import storage
@@ -30,6 +30,7 @@ def setup_test_env():
     storage.USERS_FILE = os.path.join(TEST_DATA_DIR, "users.json")
     storage.CONFIG_FILE = os.path.join(TEST_DATA_DIR, "config.json")
     storage.IMPORT_LOGS_FILE = os.path.join(TEST_DATA_DIR, "import_logs.json")
+    storage.MAINTENANCE_LOGS_FILE = os.path.join(TEST_DATA_DIR, "maintenance_logs.json")
 
 
 def cleanup_test_env():
@@ -1339,6 +1340,268 @@ def test_export_filter_info_empty_scenario():
         assert_true(has_header, "空结果 CSV 仍包含表头")
 
 
+def test_maintenance_permission_roles():
+    print("\n=== 测试35: 维修/保养 - 角色权限 ===")
+    mgr = _fresh_manager()
+
+    mgr.switch_user("zhangsan")
+    assert_true(not mgr.has_permission("send_to_maintenance"),
+                "借用人无 send_to_maintenance 权限")
+    assert_true(not mgr.has_permission("cancel_maintenance"),
+                "借用人无 cancel_maintenance 权限")
+    assert_true(not mgr.has_permission("view_maintenance"),
+                "借用人无 view_maintenance 权限")
+    assert_true(not mgr.has_permission("export_maintenance"),
+                "借用人无 export_maintenance 权限")
+    avail = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+    assert_raises(lambda: mgr.send_to_maintenance(avail.id, "测试", ""),
+                  BusinessError, "借用人调用 send_to_maintenance 抛出权限异常")
+
+    mgr.switch_user("wangwu")
+    assert_true(not mgr.has_permission("send_to_maintenance"),
+                "验收人无 send_to_maintenance 权限")
+    assert_true(not mgr.has_permission("cancel_maintenance"),
+                "验收人无 cancel_maintenance 权限")
+    assert_true(mgr.has_permission("view_maintenance"),
+                "验收人有 view_maintenance 权限")
+    assert_true(mgr.has_permission("export_maintenance"),
+                "验收人有 export_maintenance 权限")
+
+    mgr.switch_user("admin")
+    assert_true(mgr.has_permission("send_to_maintenance"),
+                "管理员有 send_to_maintenance 权限")
+    assert_true(mgr.has_permission("cancel_maintenance"),
+                "管理员有 cancel_maintenance 权限")
+    assert_true(mgr.has_permission("view_maintenance"),
+                "管理员有 view_maintenance 权限")
+    assert_true(mgr.has_permission("export_maintenance"),
+                "管理员有 export_maintenance 权限")
+
+
+def test_maintenance_basic_flow_and_conflict():
+    print("\n=== 测试36: 维修/保养 - 基本流程与冲突 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+
+    avail = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+    frozen = next(d for d in mgr.devices if d.status == DeviceStatus.FROZEN)
+    borrowed = next(d for d in mgr.devices if d.status == DeviceStatus.BORROWED)
+
+    rec, msg = mgr.send_to_maintenance(avail.id, "定期保养", "")
+    assert_eq(avail.status, DeviceStatus.MAINTENANCE, "可借出设备送修后状态为维修中")
+    assert_eq(rec.status, "in_progress", "维修记录状态为进行中")
+    assert_true("定期保养" in msg, "返回消息包含原因")
+    assert_true(any(m.id == rec.id for m in mgr.maintenance_logs),
+                "维修记录已加入内存列表")
+    logs = storage.load_maintenance_logs()
+    assert_true(any(m.id == rec.id for m in logs), "维修记录已持久化")
+
+    assert_raises(lambda: mgr.send_to_maintenance(avail.id, "再修一次", ""),
+                  BusinessError, "维修中设备不能再次送修")
+
+    assert_raises(lambda: mgr.send_to_maintenance(borrowed.id, "想修一下", ""),
+                  BusinessError, "已借出设备不能送修（有进行中记录）")
+
+    rec2, _ = mgr.send_to_maintenance(frozen.id, "异常后检修", "")
+    assert_eq(frozen.status, DeviceStatus.MAINTENANCE, "异常冻结设备可送修")
+
+    zhangsan = next(b for b in mgr.borrowers if b.name == "张三")
+    assert_raises(lambda: mgr.borrow_device(avail.id, zhangsan.id, "", [], ""),
+                  BusinessError, "维修中设备不能借出")
+
+    assert_raises(lambda: mgr.delete_device(avail.id),
+                  BusinessError, "维修中设备不能删除")
+
+    assert_raises(lambda: mgr.send_to_maintenance(avail.id, "", ""),
+                  BusinessError, "送修原因不能为空")
+
+
+def test_maintenance_cancel_boundary():
+    print("\n=== 测试37: 维修/保养 - 撤销边界 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+    avail = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+
+    can, _ = mgr.can_cancel_maintenance(avail.id)
+    assert_true(not can, "非维修中设备 cannot cancel")
+
+    mgr.send_to_maintenance(avail.id, "测试保养", "")
+    assert_eq(avail.status, DeviceStatus.MAINTENANCE, "送修成功")
+    can, _ = mgr.can_cancel_maintenance(avail.id)
+    assert_true(can, "刚送修完且无变化，可撤销")
+
+    mgr.cancel_last_maintenance(avail.id, "不需要修了")
+    assert_eq(avail.status, DeviceStatus.AVAILABLE, "撤销后恢复原状态（可借出）")
+    active = mgr.get_active_maintenance_for_device(avail.id)
+    assert_true(active is None or active.status == "cancelled",
+                "撤销后活跃维修记录状态为已撤销或不存在")
+
+    avail2 = next(d for d in mgr.devices
+                  if d.status == DeviceStatus.AVAILABLE and d.id != avail.id)
+    mgr.send_to_maintenance(avail2.id, "保养", "")
+    zhangsan = next(b for b in mgr.borrowers if b.name == "张三")
+    other_avail = next(d for d in mgr.devices
+                       if d.status == DeviceStatus.AVAILABLE and d.id != avail2.id)
+    mgr.borrow_device(other_avail.id, zhangsan.id,
+                      (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S"),
+                      [], "测试产生新借用")
+    can2, reason2 = mgr.can_cancel_maintenance(avail2.id)
+    assert_true(not can2, "有新借用后不能撤销")
+    assert_true("变化" in reason2, "提示原因包含'变化'")
+
+    mgr.switch_user("wangwu")
+    assert_raises(lambda: mgr.cancel_last_maintenance(avail2.id, ""),
+                  BusinessError, "验收人调用撤销抛出权限异常")
+
+
+def test_maintenance_config_persistence_and_filter():
+    print("\n=== 测试38: 维修/保养 - 配置持久化与记录筛选 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+    assert_eq(mgr.get_default_maintenance_days(), 7, "默认维修天数为 7")
+
+    ok, msg = mgr.set_default_maintenance_days(14)
+    assert_true(ok, "设置 14 天成功")
+    assert_eq(mgr.get_default_maintenance_days(), 14, "内存中为 14")
+
+    mgr2 = EquipmentManager()
+    mgr2.switch_user("admin")
+    assert_eq(mgr2.get_default_maintenance_days(), 14, "跨重启后默认维修天数仍为 14")
+
+    avail = next(d for d in mgr2.devices if d.status == DeviceStatus.AVAILABLE)
+    avail2 = next(d for d in mgr2.devices
+                  if d.status == DeviceStatus.AVAILABLE and d.id != avail.id)
+    mgr2.send_to_maintenance(avail.id, "设备A送修", "")
+    rec, _ = mgr2.send_to_maintenance(avail2.id, "设备B送修", "")
+    mgr2.cancel_last_maintenance(avail2.id, "取消")
+
+    all_logs = mgr2.get_maintenance_logs()
+    assert_true(len(all_logs) >= 2, "至少 2 条维修记录")
+
+    by_device = mgr2.filter_maintenance_logs(all_logs, device_id=avail.id)
+    assert_eq(len(by_device), 1, "按设备筛选仅返回该设备记录")
+
+    in_prog = mgr2.filter_maintenance_logs(all_logs, status_filter="in_progress")
+    assert_true(all(m.status == "in_progress" for m in in_prog),
+                "in_progress 筛选只返回进行中的")
+
+    cancelled = mgr2.filter_maintenance_logs(all_logs, status_filter="cancelled")
+    assert_eq(len(cancelled), 1, "cancelled 筛选返回 1 条")
+    assert_eq(cancelled[0].id, rec.id, "是那条撤销的")
+
+    empty = mgr2.filter_maintenance_logs([], status_filter="in_progress")
+    assert_eq(len(empty), 0, "空列表筛选返回 0 条")
+
+    flt = {"device_id": avail.id, "status_filter": "in_progress",
+           "start_from": "", "start_to": ""}
+    mgr2.save_maintenance_filter(flt)
+    mgr3 = EquipmentManager()
+    saved = mgr3.get_last_maintenance_filter()
+    assert_eq(saved.get("device_id"), avail.id, "跨重启保留设备筛选条件")
+    assert_eq(saved.get("status_filter"), "in_progress", "跨重启保留状态筛选条件")
+
+
+def test_maintenance_import_intercept():
+    print("\n=== 测试39: 维修/保养 - 批量导入拦截维修中设备 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+    tmpdir = tempfile.mkdtemp()
+    try:
+        avail = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+        zhangsan = next(b for b in mgr.borrowers if b.name == "张三")
+        mgr.send_to_maintenance(avail.id, "测试导入拦截", "")
+        assert_eq(avail.status, DeviceStatus.MAINTENANCE, "设备已送修")
+
+        csv_path = os.path.join(tmpdir, "maint_bad.csv")
+        with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["device_id", "borrower_id", "borrow_time", "status"])
+            writer.writerow([avail.id, zhangsan.id,
+                             (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"),
+                             RecordStatus.BORROWED])
+        ok, msg, summary = mgr.precheck_import_file(csv_path)
+        assert_true(ok, "预检执行成功")
+        assert_true(summary.device_status_conflict >= 1,
+                    f"预检识别维修中状态冲突（实际 {summary.device_status_conflict}）")
+        assert_true(summary.importable == 0, "无可导入记录")
+
+        commit_ok, commit_msg, sc, fc = mgr.commit_import(csv_path)
+        assert_true(not commit_ok, "提交导入返回失败")
+        assert_true("整批" in commit_msg, "失败消息包含整批关键词")
+        assert_eq(sc, 0, "成功导入 0 条")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_maintenance_export_with_filter_info():
+    print("\n=== 测试40: 维修/保养 - 按筛选导出并写入筛选条件 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+    tmpdir = tempfile.mkdtemp()
+    try:
+        avail = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+        avail2 = next(d for d in mgr.devices
+                      if d.status == DeviceStatus.AVAILABLE and d.id != avail.id)
+        mgr.send_to_maintenance(avail.id, "送修A", "")
+        mgr.send_to_maintenance(avail2.id, "送修B", "")
+        mgr.cancel_last_maintenance(avail2.id, "不需要了")
+        ok, _ = mgr.set_export_dir(tmpdir)
+        assert_true(ok, "导出目录设置成功")
+
+        all_logs = mgr.get_maintenance_logs()
+        in_prog = mgr.filter_maintenance_logs(all_logs, status_filter="in_progress")
+        ids = [m.id for m in in_prog]
+        assert_true(len(ids) >= 1, "至少有 1 条进行中记录")
+        filter_info = {"筛选类型": "进行中", "默认维修天数": "7 天",
+                       "description": "维修记录（进行中）"}
+
+        csv_path = os.path.join(tmpdir, "maint_inprog.csv")
+        ok, msg = mgr.export_maintenance_logs(ids, csv_path, filter_info)
+        assert_true(ok, f"CSV 导出成功: {msg}")
+        with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            lines = list(reader)
+        has_sharp = any(len(row) > 0 and str(row[0]).startswith("#") for row in lines)
+        assert_true(has_sharp, "CSV 包含 # 开头的筛选条件注释行")
+        has_maint_col = any("维修记录ID" in str(cell) for row in lines for cell in row)
+        assert_true(has_maint_col, "CSV 包含维修记录表头")
+
+        json_path = os.path.join(tmpdir, "maint_inprog.json")
+        ok, msg = mgr.export_maintenance_logs(ids, json_path, filter_info)
+        assert_true(ok, f"JSON 导出成功: {msg}")
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        assert_true("filter_info" in data, "JSON 顶层含 filter_info")
+        assert_true("records" in data, "JSON 顶层含 records")
+        assert_true("export_time" in data, "JSON 顶层含 export_time")
+        assert_eq(data["filter_info"].get("筛选类型"), "进行中",
+                  "JSON filter_info 包含筛选类型")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_maintenance_log_persistence_across_restart():
+    print("\n=== 测试41: 维修/保养 - 日志跨重启持久化 ===")
+    setup_test_env()
+    mgr = EquipmentManager()
+    mgr.switch_user("admin")
+    avail = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+    rec, _ = mgr.send_to_maintenance(avail.id, "保养1", "")
+
+    mgr2 = EquipmentManager()
+    mgr2.switch_user("admin")
+    persisted = [m for m in mgr2.maintenance_logs if m.id == rec.id]
+    assert_eq(len(persisted), 1, "跨重启后维修日志仍在内存列表中（按ID精确匹配）")
+    assert_eq(persisted[0].reason, "保养1", "日志原因正确")
+    assert_eq(persisted[0].status, "in_progress", "日志状态为进行中")
+    disk_logs = storage.load_maintenance_logs()
+    assert_true(any(m.id == rec.id for m in disk_logs),
+                "磁盘文件中也存在该日志")
+
+    dev = mgr2.find_device(avail.id)
+    assert_eq(dev.status, DeviceStatus.MAINTENANCE, "设备状态也正确持久化为维修中")
+
+
 def main():
     setup_test_env()
     try:
@@ -1376,6 +1639,13 @@ def main():
         test_borrower_view_filter_with_alert()
         test_export_with_filter_info()
         test_export_filter_info_empty_scenario()
+        test_maintenance_permission_roles()
+        test_maintenance_basic_flow_and_conflict()
+        test_maintenance_cancel_boundary()
+        test_maintenance_config_persistence_and_filter()
+        test_maintenance_import_intercept()
+        test_maintenance_export_with_filter_info()
+        test_maintenance_log_persistence_across_restart()
     finally:
         cleanup_test_env()
 
