@@ -85,23 +85,25 @@ def load_config() -> AppConfig:
 
 
 def is_dir_writable(dir_path: str) -> bool:
+    ok, _ = check_dir_writable(dir_path)
+    return ok
+
+
+def check_dir_writable(dir_path: str) -> tuple[bool, str]:
     if not dir_path:
-        return False
+        return False, "目录路径为空"
     if not os.path.exists(dir_path):
-        try:
-            os.makedirs(dir_path, exist_ok=True)
-        except OSError:
-            return False
+        return False, f"目录不存在：{dir_path}"
     if not os.path.isdir(dir_path):
-        return False
+        return False, f"路径不是一个目录：{dir_path}"
     test_file = os.path.join(dir_path, f".write_test_{os.getpid()}.tmp")
     try:
         with open(test_file, "w", encoding="utf-8") as f:
             f.write("test")
         os.remove(test_file)
-        return True
-    except (IOError, OSError):
-        return False
+        return True, "目录可写"
+    except (IOError, OSError) as e:
+        return False, f"目录没有写入权限：{dir_path}（{e}）"
 
 
 def export_records_csv(records: List[BorrowRecord], filepath: str) -> bool:

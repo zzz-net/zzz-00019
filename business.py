@@ -337,10 +337,12 @@ class EquipmentManager:
         return device
 
     def set_export_dir(self, export_dir: str) -> Tuple[bool, str]:
-        if not storage.is_dir_writable(export_dir):
+        ok, reason = storage.check_dir_writable(export_dir)
+        if not ok:
             return False, (
-                f"导出目录不可写：{export_dir}\n"
-                f"请检查目录是否存在、是否有写入权限。"
+                f"导出目录设置失败：{reason}\n"
+                f"请选择一个已存在且当前用户有写入权限的目录。\n"
+                f"（不会自动创建不存在的子目录）"
             )
         self.config.export_dir = export_dir
         self.save_all()
@@ -349,12 +351,17 @@ class EquipmentManager:
     def can_write_to_export_dir(self) -> bool:
         return storage.is_dir_writable(self.config.export_dir)
 
+    def check_export_dir_detail(self) -> Tuple[bool, str]:
+        return storage.check_dir_writable(self.config.export_dir)
+
     def export_selected_records(self, record_ids: List[str],
                                 filepath: str) -> Tuple[bool, str]:
-        if not self.can_write_to_export_dir():
+        ok, reason = self.check_export_dir_detail()
+        if not ok:
             return False, (
-                f"当前导出目录不可写：{self.config.export_dir}\n"
-                f"请先设置一个可写的导出目录。"
+                f"导出失败：{reason}\n"
+                f"请先设置一个可写的导出目录。\n"
+                f"已选记录数据未做任何改动。"
             )
         selected = [r for r in self.records if r.id in record_ids]
         if filepath.lower().endswith(".csv"):
@@ -362,21 +369,31 @@ class EquipmentManager:
         else:
             ok = storage.export_records_json(selected, filepath)
         if not ok:
-            return False, f"导出失败，文件无法写入：{filepath}"
+            return False, (
+                f"导出失败，目标文件无法写入：{filepath}\n"
+                f"请检查路径是否在导出目录下、文件是否被占用。\n"
+                f"已选记录数据未做任何改动。"
+            )
         return True, f"导出成功：{filepath}"
 
     def export_all_devices(self, filepath: str) -> Tuple[bool, str]:
-        if not self.can_write_to_export_dir():
+        ok, reason = self.check_export_dir_detail()
+        if not ok:
             return False, (
-                f"当前导出目录不可写：{self.config.export_dir}\n"
-                f"请先设置一个可写的导出目录。"
+                f"导出失败：{reason}\n"
+                f"请先设置一个可写的导出目录。\n"
+                f"设备数据未做任何改动。"
             )
         if filepath.lower().endswith(".csv"):
             ok = storage.export_devices_csv(self.devices, filepath)
         else:
             ok = storage.export_devices_json(self.devices, filepath)
         if not ok:
-            return False, f"导出失败，文件无法写入：{filepath}"
+            return False, (
+                f"导出失败，目标文件无法写入：{filepath}\n"
+                f"请检查路径是否在导出目录下、文件是否被占用。\n"
+                f"设备数据未做任何改动。"
+            )
         return True, f"导出成功：{filepath}"
 
     def get_filtered_records(self) -> List[BorrowRecord]:

@@ -774,10 +774,17 @@ class App:
         self.export_dir_var.set(self.manager.config.export_dir)
         if not self.manager.config.export_dir:
             self.export_status_label.config(text="【未设置】", foreground="#c0392b")
-        elif self.manager.can_write_to_export_dir():
+            return
+        ok, reason = self.manager.check_export_dir_detail()
+        if ok:
             self.export_status_label.config(text="【可写】", foreground="#27ae60")
         else:
-            self.export_status_label.config(text="【不可写】", foreground="#c0392b")
+            if "不存在" in reason:
+                self.export_status_label.config(text="【已失效】", foreground="#c0392b")
+            elif "没有写入权限" in reason or "写入权限" in reason:
+                self.export_status_label.config(text="【无权限】", foreground="#c0392b")
+            else:
+                self.export_status_label.config(text="【不可用】", foreground="#c0392b")
 
     def _apply_permissions(self):
         role = self.manager.current_user.role if self.manager.current_user else ""
@@ -833,11 +840,17 @@ class App:
             self._refresh_export_dir()
 
     def _check_export_dir(self) -> bool:
-        if not self.manager.can_write_to_export_dir():
+        ok, reason = self.manager.check_export_dir_detail()
+        if not ok:
             messagebox.showerror("导出失败",
-                                 f"导出目录不可写：{self.manager.config.export_dir or '未设置'}\n"
-                                 f"请先设置一个可写的导出目录。\n"
-                                 f"在导出目录可写前，任何导出操作都不会改动选中数据。")
+                                 f"当前导出目录不可用：{reason}\n\n"
+                                 f"请先在顶部点击【设置...】选择一个：\n"
+                                 f"  · 已经存在的目录（不会自动创建子目录）\n"
+                                 f"  · 当前用户有写入权限的目录\n\n"
+                                 f"在导出目录恢复可用前，任何导出操作：\n"
+                                 f"  · 不会改动已选中的记录/设备数据\n"
+                                 f"  · 不会生成任何导出文件\n"
+                                 f"  · 不会覆盖之前保存的常用导出目录")
             return False
         return True
 
