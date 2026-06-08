@@ -1,0 +1,48 @@
+[
+  {
+    "id": "c33291e9",
+    "device_id": "0369fa2c",
+    "device_name": "明基投影仪 MW550",
+    "borrower_id": "a2cd09e3",
+    "borrower_name": "张三",
+    "borrower_department": "研发部",
+    "borrow_time": "2026-06-05 09:30:00",
+    "expected_return_time": "2026-06-07 18:00:00",
+    "actual_return_time": "",
+    "status": "借出中",
+    "accessories_check_out": [
+      {
+        "name": "电源适配器",
+        "required": true,
+        "present": true
+      },
+      {
+        "name": "HDMI线",
+        "required": true,
+        "present": true
+      },
+      {
+        "name": "遥控器",
+        "required": true,
+        "present": true
+      }
+    ],
+    "accessories_check_in": [],
+    "check_out_operator": "admin",
+    "check_in_operator": "",
+    "inspect_operator": "",
+    "inspect_remark": "",
+    "close_operator": "",
+    "history": [
+      {
+        "timestamp": "2026-06-08 09:29:18",
+        "from_status": "可借出",
+        "to_status": "借出中",
+        "operator": "admin",
+        "operator_role": "管理员",
+        "remark": "季度会议借出"
+      }
+    ],
+    "remark": "季度会议使用"
+  }
+]

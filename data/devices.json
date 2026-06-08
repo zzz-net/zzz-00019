@@ -1,0 +1,105 @@
+[
+  {
+    "id": "a75e2d52",
+    "name": "爱普生投影仪 CB-X05",
+    "category": "投影仪",
+    "model": "CB-X05",
+    "serial_no": "EPSN-2024-001",
+    "status": "可借出",
+    "accessories": [
+      {
+        "name": "电源适配器",
+        "required": true,
+        "present": true
+      },
+      {
+        "name": "HDMI线",
+        "required": true,
+        "present": true
+      },
+      {
+        "name": "VGA线",
+        "required": false,
+        "present": true
+      },
+      {
+        "name": "遥控器",
+        "required": true,
+        "present": true
+      }
+    ],
+    "remark": "3LCD技术，3300流明",
+    "created_at": "2026-06-08 09:29:18"
+  },
+  {
+    "id": "54b3dab8",
+    "name": "索尼录音笔 ICD-PX470",
+    "category": "录音笔",
+    "model": "ICD-PX470",
+    "serial_no": "SNY-2024-101",
+    "status": "可借出",
+    "accessories": [
+      {
+        "name": "USB充电线",
+        "required": true,
+        "present": true
+      },
+      {
+        "name": "立体声麦克风",
+        "required": false,
+        "present": false
+      }
+    ],
+    "remark": "4GB内存，支持线性PCM录音",
+    "created_at": "2026-06-08 09:29:18"
+  },
+  {
+    "id": "0369fa2c",
+    "name": "明基投影仪 MW550",
+    "category": "投影仪",
+    "model": "MW550",
+    "serial_no": "BENQ-2024-002",
+    "status": "已借出",
+    "accessories": [
+      {
+        "name": "电源适配器",
+        "required": true,
+        "present": true
+      },
+      {
+        "name": "HDMI线",
+        "required": true,
+        "present": true
+      },
+      {
+        "name": "遥控器",
+        "required": true,
+        "present": true
+      }
+    ],
+    "remark": "3600流明，WXGA分辨率",
+    "created_at": "2026-06-08 09:29:18"
+  },
+  {
+    "id": "5b9e690c",
+    "name": "罗技摄像头 C920",
+    "category": "摄像头",
+    "model": "C920",
+    "serial_no": "LOGT-2024-201",
+    "status": "异常冻结",
+    "accessories": [
+      {
+        "name": "USB数据线",
+        "required": true,
+        "present": true
+      },
+      {
+        "name": "镜头盖",
+        "required": false,
+        "present": false
+      }
+    ],
+    "remark": "1080p高清，自动对焦",
+    "created_at": "2026-06-08 09:29:18"
+  }
+]
