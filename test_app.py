@@ -12,7 +12,8 @@ from models import (
     Device, Borrower, BorrowRecord, Accessory, User, AppConfig,
     DeviceStatus, RecordStatus, UserRole, MaintenanceRecord,
     InventorySession, InventoryItem, InventoryStatus, InventoryItemResult,
-    HandoffRecord, HandoffAction, HandoffStatus
+    HandoffRecord, HandoffAction, HandoffStatus,
+    DeviceAccessory, AccessoryType
 )
 from business import EquipmentManager, BusinessError
 import storage
@@ -35,6 +36,7 @@ def setup_test_env():
     storage.MAINTENANCE_LOGS_FILE = os.path.join(TEST_DATA_DIR, "maintenance_logs.json")
     storage.INVENTORY_FILE = os.path.join(TEST_DATA_DIR, "inventory_sessions.json")
     storage.HANDOFF_DB_FILE = os.path.join(TEST_DATA_DIR, "handover_records.db")
+    storage.ACCESSORIES_FILE = os.path.join(TEST_DATA_DIR, "accessories.json")
 
 
 def cleanup_test_env():
@@ -2491,6 +2493,302 @@ def test_handoff_filter_and_empty_scenario():
     assert_eq(len(empty), 0, "空列表筛选返回 0 条")
 
 
+def test_accessory_permission_roles():
+    print("\n=== 测试58: 设备附件与证照 - 权限控制 ===")
+    mgr = _fresh_manager()
+
+    mgr.switch_user("admin")
+    assert_true(mgr.has_permission("view_accessory_all"), "管理员有查看全部附件权限")
+    assert_true(mgr.has_permission("add_accessory"), "管理员有新增附件权限")
+    assert_true(mgr.has_permission("edit_accessory"), "管理员有编辑附件权限")
+    assert_true(mgr.has_permission("delete_accessory"), "管理员有删除附件权限")
+    assert_true(mgr.has_permission("import_accessories"), "管理员有导入附件权限")
+    assert_true(mgr.has_permission("export_accessories"), "管理员有导出附件权限")
+    assert_true(mgr.has_permission("view_own_accessory"), "管理员有查看自己附件权限")
+
+    mgr.switch_user("zhangsan")
+    assert_true(not mgr.has_permission("view_accessory_all"), "借用人无查看全部附件权限")
+    assert_true(not mgr.has_permission("add_accessory"), "借用人无新增附件权限")
+    assert_true(not mgr.has_permission("edit_accessory"), "借用人无编辑附件权限")
+    assert_true(not mgr.has_permission("delete_accessory"), "借用人无删除附件权限")
+    assert_true(not mgr.has_permission("import_accessories"), "借用人无导入附件权限")
+    assert_true(not mgr.has_permission("export_accessories"), "借用人无导出附件权限")
+    assert_true(mgr.has_permission("view_own_accessory"), "借用人有查看自己附件权限")
+
+    mgr.switch_user("wangwu")
+    assert_true(mgr.has_permission("view_accessory_all"), "验收人有查看全部附件权限")
+    assert_true(not mgr.has_permission("add_accessory"), "验收人无新增附件权限")
+    assert_true(not mgr.has_permission("edit_accessory"), "验收人无编辑附件权限")
+    assert_true(not mgr.has_permission("delete_accessory"), "验收人无删除附件权限")
+    assert_true(not mgr.has_permission("import_accessories"), "验收人无导入附件权限")
+    assert_true(mgr.has_permission("export_accessories"), "验收人有导出附件权限")
+
+
+def test_accessory_crud_and_validation():
+    print("\n=== 测试59: 设备附件与证照 - CRUD + 字段校验 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+
+    avail = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+
+    acc = mgr.add_accessory(
+        device_id=avail.id, name="电源线", type=AccessoryType.ACCESSORY,
+        quantity=2, serial_no="ACC-001", storage_location="设备柜A",
+        expiry_date="2027-12-31", responsible_person="张三", remark="原装"
+    )
+    assert_true(acc.id is not None and acc.id != "", "附件ID已生成")
+    assert_eq(acc.name, "电源线", "附件名称正确")
+    assert_eq(acc.type, AccessoryType.ACCESSORY, "附件类型正确")
+    assert_eq(acc.quantity, 2, "附件数量正确")
+    assert_eq(acc.serial_no, "ACC-001", "附件编号正确")
+    assert_eq(acc.created_by, "admin", "创建人为 admin")
+
+    assert_eq(len(mgr.get_accessories_by_device(avail.id)), 1, "按设备查询附件数量")
+    assert_eq(len(mgr.get_accessories()), 1, "全部附件数量")
+
+    acc2 = mgr.update_accessory(acc.id, name="HDMI 高清线", quantity=1, remark="更新备注")
+    assert_eq(acc2.name, "HDMI 高清线", "更新名称生效")
+    assert_eq(acc2.quantity, 1, "更新数量生效")
+    assert_eq(acc2.remark, "更新备注", "更新备注生效")
+    assert_true(acc2.updated_at is not None and acc2.updated_at != "", "更新时间有记录")
+    assert_eq(acc2.updated_by, "admin", "更新人记录")
+
+    mgr.delete_accessory(acc.id)
+    assert_eq(len(mgr.get_accessories()), 0, "删除后附件数量为 0")
+
+    assert_raises(lambda: mgr.add_accessory(avail.id, "遥控器", quantity=0),
+                  BusinessError, "数量为 0 抛出异常")
+    assert_raises(lambda: mgr.add_accessory(avail.id, "遥控器", quantity=-1),
+                  BusinessError, "数量为负数抛出异常")
+    assert_raises(lambda: mgr.add_accessory(avail.id, "", quantity=1),
+                  BusinessError, "名称为空抛出异常")
+    assert_raises(lambda: mgr.add_accessory(avail.id, "保修卡",
+                                            expiry_date="2027/12/31"),
+                  BusinessError, "日期格式错误抛出异常")
+
+    a1 = mgr.add_accessory(avail.id, "校准证书", serial_no="CERT-001")
+    assert_raises(lambda: mgr.add_accessory(avail.id, "另一份证书",
+                                            serial_no="CERT-001"),
+                  BusinessError, "重复编号抛出异常")
+
+
+def test_accessory_persistence_across_restart():
+    print("\n=== 测试60: 设备附件与证照 - 跨重启持久化 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+
+    avail = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+    acc1 = mgr.add_accessory(avail.id, "电源线", AccessoryType.ACCESSORY,
+                             quantity=1, serial_no="ACC-RST-001")
+    acc2 = mgr.add_accessory(avail.id, "校准证书", AccessoryType.CERTIFICATE,
+                             quantity=1, serial_no="CERT-RST-001",
+                             expiry_date="2027-12-31")
+    saved_ids = {acc1.id, acc2.id}
+
+    mgr2 = EquipmentManager()
+    mgr2.switch_user("admin")
+    loaded = mgr2.get_accessories()
+    assert_eq(len(loaded), 2, "重启后仍有 2 条附件")
+    assert_eq({a.id for a in loaded}, saved_ids, "重启后附件ID一致")
+    names = sorted([a.name for a in loaded])
+    assert_eq(names, ["校准证书", "电源线"], "重启后附件名称一致")
+
+
+def test_accessory_import_precheck_and_rollback():
+    print("\n=== 测试61: 设备附件与证照 - 批量导入预检 + 失败不写盘 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+
+    avail = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+    tmpdir = tempfile.mkdtemp()
+    try:
+        bad_csv = os.path.join(tmpdir, "acc_bad.csv")
+        with open(bad_csv, "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["device_id", "name", "quantity", "serial_no", "expiry_date"])
+            w.writerow([avail.id, "电源线", "1", "GOOD-01", "2027-12-31"])
+            w.writerow(["UNKNOWN-ID", "保修卡", "1", "", ""])
+            w.writerow([avail.id, "遥控器", "-5", "", ""])
+            w.writerow([avail.id, "校准证书", "1", "GOOD-01", ""])
+            w.writerow([avail.id, "软件授权", "1", "BAD-DATE", "2027/12/31"])
+
+        ok, msg, summary = mgr.precheck_accessory_import_file(bad_csv)
+        assert_true(ok, "预检执行成功")
+        assert_eq(summary.total, 5, "预检识别 5 行")
+        assert_true(summary.device_not_found >= 1, "预检识别未知设备")
+        assert_true(summary.duplicate >= 1, "预检识别重复编号")
+        kind_list = [i.get("kind") for i in summary.issues]
+        assert_true("数量非法" in kind_list, "预检识别数量非法")
+        assert_true("日期格式错误" in kind_list, "预检识别日期格式错误")
+
+        commit_ok, commit_msg, sc, fc = mgr.commit_accessory_import(bad_csv)
+        assert_true(not commit_ok, "失败数据不写入，整批拒绝")
+        assert_eq(sc, 0, "成功条数为 0")
+        assert_eq(len(mgr.get_accessories()), 0, "附件数量仍为 0，无半成品")
+
+        good_csv = os.path.join(tmpdir, "acc_good.csv")
+        with open(good_csv, "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["device_id", "name", "type", "quantity", "serial_no",
+                        "storage_location", "expiry_date", "responsible_person", "remark"])
+            w.writerow([avail.id, "电源线", "附件", "2", "IMP-001",
+                        "设备柜A", "2027-12-31", "张三", "批量导入测试"])
+            w.writerow([avail.id, "保修卡", "证照", "1", "BATCH-001",
+                        "", "", "", "批量导入"])
+
+        commit_ok2, commit_msg2, sc2, fc2 = mgr.commit_accessory_import(good_csv)
+        assert_true(commit_ok2, "合法数据导入成功")
+        assert_eq(sc2, 2, "成功导入 2 条")
+        assert_eq(fc2, 0, "失败 0 条")
+        assert_eq(len(mgr.get_accessories()), 2, "导入后附件数量 2")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_accessory_export_fields():
+    print("\n=== 测试62: 设备附件与证照 - 导出字段完整 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+
+    avail = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+    acc = mgr.add_accessory(
+        device_id=avail.id, name="电源线", type=AccessoryType.ACCESSORY,
+        quantity=2, serial_no="EXP-001", storage_location="设备柜A",
+        expiry_date="2027-12-31", responsible_person="张三", remark="批量"
+    )
+
+    tmpdir = tempfile.mkdtemp()
+    export_dir = os.path.join(tmpdir, "exports")
+    os.makedirs(export_dir, exist_ok=True)
+    mgr.set_export_dir(export_dir)
+
+    try:
+        csv_path = os.path.join(export_dir, "acc_export.csv")
+        filter_info = {"description": "测试导出", "type": "附件", "operator": "admin"}
+        ok, msg = mgr.export_accessories([acc.id], csv_path, filter_info)
+        assert_true(ok, "CSV 导出成功")
+
+        with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+        assert_true(len(rows) >= 5, "CSV 有多行（含注释头、表头、数据）")
+
+        header_row = None
+        for i, row in enumerate(rows):
+            if len(row) > 0 and row[0] == "附件ID":
+                header_row = row
+                break
+        assert_true(header_row is not None, "找到 CSV 表头行")
+        header_str = "|".join(header_row)
+        assert_true("附件ID" in header_str, "CSV 包含附件ID列")
+        assert_true("设备ID" in header_str, "CSV 包含设备ID列")
+        assert_true("设备名称" in header_str, "CSV 包含设备名称列")
+        assert_true("附件/证照名称" in header_str, "CSV 包含附件名称列")
+        assert_true("类型" in header_str, "CSV 包含类型列")
+        assert_true("数量" in header_str, "CSV 包含数量列")
+        assert_true("编号" in header_str, "CSV 包含编号列")
+        assert_true("存放位置" in header_str, "CSV 包含存放位置列")
+        assert_true("到期日" in header_str, "CSV 包含到期日列")
+        assert_true("责任人" in header_str, "CSV 包含责任人列")
+        assert_true("创建人" in header_str, "CSV 包含创建人列")
+        assert_true("导出操作人" in "|".join(rows[0]), "CSV 包含导出操作人注释")
+
+        json_path = os.path.join(export_dir, "acc_export.json")
+        ok2, msg2 = mgr.export_accessories([acc.id], json_path, filter_info)
+        assert_true(ok2, "JSON 导出成功")
+
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        assert_true("export_time" in data, "JSON 包含导出时间")
+        assert_eq(data["export_operator"], "admin", "JSON 导出操作人正确")
+        assert_true("filter_info" in data, "JSON 包含筛选条件")
+        assert_eq(len(data["records"]), 1, "JSON 记录数正确")
+        rec = data["records"][0]
+        assert_eq(rec["name"], "电源线", "JSON 附件名称正确")
+        assert_eq(rec["type"], AccessoryType.ACCESSORY, "JSON 类型正确")
+        assert_eq(rec["quantity"], 2, "JSON 数量正确")
+        assert_true("device_info" in rec, "JSON 含关联设备信息")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_accessory_maintenance_lock_for_borrower():
+    print("\n=== 测试63: 设备附件与证照 - 维修中借用人不能修改 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+
+    avail = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+    acc = mgr.add_accessory(avail.id, "电源线", quantity=1,
+                            serial_no="MAINT-LOCK-001")
+
+    mgr.send_to_maintenance(avail.id, "测试维修", "")
+    device_after = mgr.find_device(avail.id)
+    assert_eq(device_after.status, DeviceStatus.MAINTENANCE, "设备已进入维修状态")
+
+    mgr.switch_user("zhangsan")
+    assert_raises(lambda: mgr.update_accessory(acc.id, name="被借用人修改"),
+                  BusinessError, "借用人修改维修中设备附件被拒绝")
+    assert_raises(lambda: mgr.delete_accessory(acc.id),
+                  BusinessError, "借用人删除维修中设备附件被拒绝")
+    assert_raises(lambda: mgr.add_accessory(avail.id, "借用人新增", quantity=1),
+                  BusinessError, "借用人新增维修中设备附件被拒绝")
+
+    mgr.switch_user("admin")
+    acc2 = mgr.update_accessory(acc.id, name="管理员修改成功")
+    assert_eq(acc2.name, "管理员修改成功", "管理员仍可修改维修中设备附件")
+
+
+def test_accessory_borrower_view_own_only():
+    print("\n=== 测试64: 设备附件与证照 - 借用人仅可见自己相关设备 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+
+    avail_devices = [d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE]
+    d1 = avail_devices[0]
+    d2 = avail_devices[1] if len(avail_devices) > 1 else avail_devices[0]
+
+    acc1 = mgr.add_accessory(d1.id, "设备1附件", quantity=1, serial_no="VIEW-001")
+    acc2 = mgr.add_accessory(d2.id, "设备2附件", quantity=1, serial_no="VIEW-002")
+
+    zhangsan = next(b for b in mgr.borrowers if b.name == "张三")
+    mgr.borrow_device(d1.id, zhangsan.id,
+                      (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S"),
+                      [], "测试借用")
+
+    mgr.switch_user("zhangsan")
+    visible = mgr.get_accessories()
+    visible_ids = {a.id for a in visible}
+    assert_true(acc1.id in visible_ids, "借用人可见张三借用设备的附件")
+    if d1.id != d2.id:
+        assert_true(acc2.id not in visible_ids, "借用人不可见其他设备的附件")
+
+    mgr.switch_user("admin")
+    all_visible = mgr.get_accessories()
+    assert_eq(len(all_visible), 2, "管理员可见全部附件")
+
+
+def test_accessory_check_hint_for_borrow_return():
+    print("\n=== 测试65: 设备附件与证照 - 借出归还提示 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+
+    avail = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+    mgr.add_accessory(avail.id, "电源线", quantity=1)
+    mgr.add_accessory(avail.id, "遥控器", quantity=1)
+    mgr.add_accessory(avail.id, "保修卡", type=AccessoryType.CERTIFICATE, quantity=1)
+
+    hint = mgr.get_accessory_check_hint(avail.id)
+    assert_true("电源线" in hint, "提示包含电源线")
+    assert_true("遥控器" in hint, "提示包含遥控器")
+    assert_true("保修卡" in hint, "提示包含保修卡")
+    assert_true("核对" in hint, "提示有核对关键词")
+
+    no_acc_dev = next(d for d in mgr.devices if d.id != avail.id
+                      and d.status == DeviceStatus.AVAILABLE)
+    no_hint = mgr.get_accessory_check_hint(no_acc_dev.id)
+    assert_eq(no_hint, "", "无附件设备提示为空字符串")
+
+
 def main():
     setup_test_env()
     try:
@@ -2551,6 +2849,14 @@ def main():
         test_handoff_borrower_objection_and_view_own()
         test_handoff_export_fields_csv_and_json()
         test_handoff_filter_and_empty_scenario()
+        test_accessory_permission_roles()
+        test_accessory_crud_and_validation()
+        test_accessory_persistence_across_restart()
+        test_accessory_import_precheck_and_rollback()
+        test_accessory_export_fields()
+        test_accessory_maintenance_lock_for_borrower()
+        test_accessory_borrower_view_own_only()
+        test_accessory_check_hint_for_borrow_return()
     finally:
         cleanup_test_env()
 

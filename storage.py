@@ -8,7 +8,8 @@ from models import (
     Device, Borrower, BorrowRecord, User, AppConfig,
     DeviceStatus, RecordStatus, UserRole, Accessory, _now_str,
     ImportPrecheckSummary, ImportLogEntry, MaintenanceRecord,
-    InventorySession, InventoryItem, HandoffRecord, HandoffStatus
+    InventorySession, InventoryItem, HandoffRecord, HandoffStatus,
+    DeviceAccessory, AccessoryType
 )
 
 
@@ -22,6 +23,16 @@ IMPORT_LOGS_FILE = os.path.join(DATA_DIR, "import_logs.json")
 MAINTENANCE_LOGS_FILE = os.path.join(DATA_DIR, "maintenance_logs.json")
 INVENTORY_FILE = os.path.join(DATA_DIR, "inventory_sessions.json")
 HANDOFF_DB_FILE = os.path.join(DATA_DIR, "handover_records.db")
+ACCESSORIES_FILE = os.path.join(DATA_DIR, "accessories.json")
+
+
+ACCESSORY_IMPORT_REQUIRED_FIELDS = [
+    "device_id", "name"
+]
+ACCESSORY_IMPORT_OPTIONAL_FIELDS = [
+    "device_name", "type", "quantity", "serial_no",
+    "storage_location", "expiry_date", "responsible_person", "remark"
+]
 
 
 IMPORT_REQUIRED_FIELDS = [
@@ -698,6 +709,89 @@ def export_handoff_json(records: List[HandoffRecord], filepath: str,
             if filter_info:
                 safe_filter = {k: v for k, v in filter_info.items() if k != "_alert_status"}
                 data["filter_info"] = safe_filter
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except (IOError, OSError):
+        return False
+
+
+def save_accessories(accessories: List[DeviceAccessory]):
+    _save_json(ACCESSORIES_FILE, [a.to_dict() for a in accessories])
+
+
+def load_accessories() -> List[DeviceAccessory]:
+    data = _load_json(ACCESSORIES_FILE, [])
+    return [DeviceAccessory.from_dict(d) for d in data]
+
+
+def export_accessories_csv(accessories: List[DeviceAccessory], filepath: str,
+                           filter_info: Optional[dict] = None,
+                           operator: str = "",
+                           devices_map: Optional[Dict[str, Device]] = None) -> bool:
+    try:
+        with open(filepath, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([f"# 导出操作人: {operator}"])
+            writer.writerow([f"# 导出时间: {_now_str()}"])
+            if filter_info:
+                writer.writerow([f"# 筛选条件: {filter_info.get('description', '')}"])
+                for k, v in filter_info.items():
+                    if k != "description":
+                        writer.writerow([f"# {k}: {v}"])
+            writer.writerow([
+                "附件ID", "设备ID", "设备名称", "设备类别", "设备型号",
+                "设备序列号", "设备状态", "设备存放点", "设备负责人",
+                "附件/证照名称", "类型", "数量", "编号",
+                "存放位置", "到期日", "责任人", "备注",
+                "创建时间", "创建人", "更新时间", "更新人"
+            ])
+            for a in accessories:
+                dev = devices_map.get(a.device_id) if devices_map else None
+                writer.writerow([
+                    a.id, a.device_id,
+                    a.device_name if a.device_name else (dev.name if dev else ""),
+                    dev.category if dev else "",
+                    dev.model if dev else "",
+                    dev.serial_no if dev else "",
+                    dev.status if dev else "",
+                    dev.storage_location if dev else "",
+                    dev.responsible_person if dev else "",
+                    a.name, a.type, a.quantity, a.serial_no,
+                    a.storage_location, a.expiry_date, a.responsible_person, a.remark,
+                    a.created_at, a.created_by, a.updated_at, a.updated_by
+                ])
+        return True
+    except (IOError, OSError):
+        return False
+
+
+def export_accessories_json(accessories: List[DeviceAccessory], filepath: str,
+                            filter_info: Optional[dict] = None,
+                            operator: str = "",
+                            devices_map: Optional[Dict[str, Device]] = None) -> bool:
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            records = []
+            for a in accessories:
+                rec = a.to_dict()
+                dev = devices_map.get(a.device_id) if devices_map else None
+                if dev:
+                    rec["device_info"] = {
+                        "category": dev.category,
+                        "model": dev.model,
+                        "serial_no": dev.serial_no,
+                        "status": dev.status,
+                        "storage_location": dev.storage_location,
+                        "responsible_person": dev.responsible_person,
+                    }
+                records.append(rec)
+            data = {
+                "export_time": _now_str(),
+                "export_operator": operator,
+                "records": records,
+            }
+            if filter_info:
+                data["filter_info"] = dict(filter_info)
             json.dump(data, f, ensure_ascii=False, indent=2)
         return True
     except (IOError, OSError):

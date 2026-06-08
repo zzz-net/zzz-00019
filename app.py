@@ -8,7 +8,8 @@ from models import (
     DeviceStatus, RecordStatus, UserRole, User, _now_str,
     MaintenanceRecord, InventorySession, InventoryItem,
     InventoryStatus, InventoryItemResult,
-    HandoffRecord, HandoffAction, HandoffStatus
+    HandoffRecord, HandoffAction, HandoffStatus,
+    DeviceAccessory, AccessoryType
 )
 from business import EquipmentManager, BusinessError
 
@@ -81,6 +82,12 @@ HANDOFF_BUSINESS_STATUS_LABELS = {
     RecordStatus.FROZEN: "异常冻结",
     DeviceStatus.AVAILABLE: "可借出",
     DeviceStatus.MAINTENANCE: "维修中",
+}
+
+ACCESSORY_TYPE_LABELS = {
+    "all": "全部",
+    "附件": "附件",
+    "证照": "证照",
 }
 
 
@@ -300,6 +307,110 @@ class BorrowerDialog(tk.Toplevel):
             "name": self.name_var.get().strip(),
             "department": self.dept_var.get().strip(),
             "phone": self.phone_var.get().strip(),
+        }
+        self.destroy()
+
+
+class AccessoryDialog(tk.Toplevel):
+    def __init__(self, master, manager: EquipmentManager, accessory: Optional[DeviceAccessory] = None):
+        super().__init__(master)
+        self.title("附件/证照编辑" if accessory else "新增附件/证照")
+        self.geometry("560x560")
+        self.resizable(False, False)
+        self.manager = manager
+        self.accessory = accessory
+        self.result = None
+        self._build()
+        self.grab_set()
+        self.transient(master)
+
+    def _build(self):
+        main = ttk.Frame(self, padding=12)
+        main.pack(fill="both", expand=True)
+
+        ttk.Label(main, text="设备 *:").grid(row=0, column=0, sticky="ne", pady=4)
+        self.device_var = tk.StringVar()
+        device_values = [f"{d.id} - {d.name}" for d in self.manager.devices]
+        device_combo = ttk.Combobox(main, textvariable=self.device_var,
+                                   values=device_values, state="readonly", width=50)
+        device_combo.grid(row=0, column=1, pady=4, sticky="w")
+        if self.accessory:
+            device_combo.configure(state="disabled")
+            for idx, dv in enumerate(device_values):
+                if dv.startswith(f"{self.accessory.device_id} -"):
+                    device_combo.current(idx)
+                    break
+
+        ttk.Label(main, text="名称 *:").grid(row=1, column=0, sticky="ne", pady=4)
+        self.name_var = tk.StringVar(value=self.accessory.name if self.accessory else "")
+        ttk.Entry(main, textvariable=self.name_var, width=52).grid(row=1, column=1, pady=4, sticky="w")
+
+        ttk.Label(main, text="类型 *:").grid(row=2, column=0, sticky="ne", pady=4)
+        self.type_var = tk.StringVar(value=self.accessory.type if self.accessory else AccessoryType.ACCESSORY)
+        ttk.Combobox(main, textvariable=self.type_var,
+                     values=AccessoryType.ALL_TYPES, state="readonly", width=49
+                     ).grid(row=2, column=1, pady=4, sticky="w")
+
+        ttk.Label(main, text="数量:").grid(row=3, column=0, sticky="ne", pady=4)
+        self.quantity_var = tk.StringVar(value=str(self.accessory.quantity) if self.accessory else "1")
+        ttk.Spinbox(main, from_=1, to=9999, textvariable=self.quantity_var, width=48
+                     ).grid(row=3, column=1, pady=4, sticky="w")
+
+        ttk.Label(main, text="编号:").grid(row=4, column=0, sticky="ne", pady=4)
+        self.serial_no_var = tk.StringVar(value=self.accessory.serial_no if self.accessory else "")
+        ttk.Entry(main, textvariable=self.serial_no_var, width=52).grid(row=4, column=1, pady=4, sticky="w")
+
+        ttk.Label(main, text="存放位置:").grid(row=5, column=0, sticky="ne", pady=4)
+        self.storage_location_var = tk.StringVar(
+            value=self.accessory.storage_location if self.accessory else "")
+        ttk.Entry(main, textvariable=self.storage_location_var, width=52).grid(row=5, column=1, pady=4, sticky="w")
+
+        ttk.Label(main, text="到期日 (YYYY-MM-DD):").grid(row=6, column=0, sticky="ne", pady=4)
+        self.expiry_date_var = tk.StringVar(value=self.accessory.expiry_date if self.accessory else "")
+        ttk.Entry(main, textvariable=self.expiry_date_var, width=52).grid(row=6, column=1, pady=4, sticky="w")
+
+        ttk.Label(main, text="责任人:").grid(row=7, column=0, sticky="ne", pady=4)
+        self.responsible_person_var = tk.StringVar(
+            value=self.accessory.responsible_person if self.accessory else "")
+        ttk.Entry(main, textvariable=self.responsible_person_var, width=52).grid(row=7, column=1, pady=4, sticky="w")
+
+        ttk.Label(main, text="备注:").grid(row=8, column=0, sticky="ne", pady=4)
+        self.remark_text = tk.Text(main, width=50, height=4)
+        self.remark_text.grid(row=8, column=1, pady=4, sticky="w")
+        if self.accessory and self.accessory.remark:
+            self.remark_text.insert("1.0", self.accessory.remark)
+
+        btns = ttk.Frame(main)
+        btns.grid(row=9, column=0, columnspan=2, pady=(12, 0))
+        ttk.Button(btns, text="确定", command=self._ok).pack(side="left", padx=6)
+        ttk.Button(btns, text="取消", command=self.destroy).pack(side="left", padx=6)
+
+    def _ok(self):
+        if not self.device_var.get():
+            messagebox.showerror("错误", "请选择设备", parent=self)
+            return
+        device_id = self.device_var.get().split(" - ")[0]
+        if not self.name_var.get().strip():
+            messagebox.showerror("错误", "名称不能为空", parent=self)
+            return
+        try:
+            quantity = int(self.quantity_var.get())
+        except ValueError:
+            messagebox.showerror("错误", "数量必须是整数", parent=self)
+            return
+        if quantity <= 0:
+            messagebox.showerror("错误", "数量必须大于0", parent=self)
+            return
+        self.result = {
+            "device_id": device_id,
+            "name": self.name_var.get().strip(),
+            "type": self.type_var.get().strip(),
+            "quantity": quantity,
+            "serial_no": self.serial_no_var.get().strip(),
+            "storage_location": self.storage_location_var.get().strip(),
+            "expiry_date": self.expiry_date_var.get().strip(),
+            "responsible_person": self.responsible_person_var.get().strip(),
+            "remark": self.remark_text.get("1.0", "end").strip(),
         }
         self.destroy()
 
@@ -1334,6 +1445,14 @@ class App:
         self._handoff_filter_business_status: str = "all"
         self._handoff_filter_status: str = "all"
         self._handoff_filter_action: str = "all"
+        self._selected_accessory_ids: List[str] = []
+        self._accessory_filter_device: str = ""
+        self._accessory_filter_type: str = "all"
+        self._accessory_filter_keyword: str = ""
+        self._accessory_filter_serial_no: str = ""
+        self._accessory_filter_expiry_from: str = ""
+        self._accessory_filter_expiry_to: str = ""
+        self._accessory_filter_responsible_person: str = ""
         self._build_ui()
         self._refresh_all()
 
@@ -1387,13 +1506,16 @@ class App:
         records_tab = ttk.Frame(self.right_notebook)
         inventory_tab = ttk.Frame(self.right_notebook)
         handoff_tab = ttk.Frame(self.right_notebook)
+        accessories_tab = ttk.Frame(self.right_notebook)
         self.right_notebook.add(records_tab, text="借用记录")
         self.right_notebook.add(inventory_tab, text="盘点工作台")
         self.right_notebook.add(handoff_tab, text="交接复核")
+        self.right_notebook.add(accessories_tab, text="附件台账")
 
         self._build_records_panel(records_tab)
         self._build_inventory_panel(inventory_tab)
         self._build_handoff_panel(handoff_tab)
+        self._build_accessories_panel(accessories_tab)
         self._build_maintenance_panel(left_frame)
 
         self.status_var = tk.StringVar(value="就绪")
@@ -1762,6 +1884,109 @@ class App:
         self.handoff_tree.tag_configure(HandoffStatus.OBJECTED, foreground="#c0392b", background="#fdecea")
         self.handoff_tree.tag_configure(HandoffStatus.COMPLETED, foreground="#27ae60")
 
+    def _build_accessories_panel(self, parent):
+        frame = ttk.LabelFrame(parent, text="附件台账", padding=6)
+        frame.pack(fill="both", expand=True)
+
+        filter_row1 = ttk.Frame(frame)
+        filter_row1.pack(fill="x", pady=(0, 4))
+
+        ttk.Label(filter_row1, text="设备ID/名称:").pack(side="left", padx=(0, 2))
+        self.acc_device_var = tk.StringVar()
+        ttk.Entry(filter_row1, textvariable=self.acc_device_var, width=14).pack(side="left", padx=(0, 6))
+
+        ttk.Label(filter_row1, text="类型:").pack(side="left", padx=(0, 2))
+        self.acc_type_var = tk.StringVar(value=ACCESSORY_TYPE_LABELS["all"])
+        ttk.Combobox(filter_row1, textvariable=self.acc_type_var, width=8, state="readonly",
+                     values=list(ACCESSORY_TYPE_LABELS.values())
+                     ).pack(side="left", padx=(0, 6))
+
+        ttk.Label(filter_row1, text="关键词:").pack(side="left", padx=(0, 2))
+        self.acc_keyword_var = tk.StringVar()
+        ttk.Entry(filter_row1, textvariable=self.acc_keyword_var, width=12).pack(side="left", padx=(0, 6))
+
+        ttk.Label(filter_row1, text="编号:").pack(side="left", padx=(0, 2))
+        self.acc_serial_var = tk.StringVar()
+        ttk.Entry(filter_row1, textvariable=self.acc_serial_var, width=12).pack(side="left", padx=(0, 6))
+
+        filter_row2 = ttk.Frame(frame)
+        filter_row2.pack(fill="x", pady=(0, 4))
+
+        ttk.Label(filter_row2, text="到期起:").pack(side="left", padx=(0, 2))
+        self.acc_expiry_from_var = tk.StringVar()
+        ttk.Entry(filter_row2, textvariable=self.acc_expiry_from_var, width=12).pack(side="left", padx=(0, 6))
+
+        ttk.Label(filter_row2, text="到期止:").pack(side="left", padx=(0, 2))
+        self.acc_expiry_to_var = tk.StringVar()
+        ttk.Entry(filter_row2, textvariable=self.acc_expiry_to_var, width=12).pack(side="left", padx=(0, 6))
+
+        ttk.Label(filter_row2, text="责任人:").pack(side="left", padx=(0, 2))
+        self.acc_resp_var = tk.StringVar()
+        ttk.Entry(filter_row2, textvariable=self.acc_resp_var, width=12).pack(side="left", padx=(0, 6))
+
+        self.btn_acc_apply = ttk.Button(filter_row2, text="应用筛选",
+                                        command=self._on_accessory_filter_apply)
+        self.btn_acc_apply.pack(side="left", padx=2)
+        self.btn_acc_reset = ttk.Button(filter_row2, text="重置",
+                                        command=self._on_accessory_filter_reset)
+        self.btn_acc_reset.pack(side="left", padx=2)
+
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(fill="x", pady=(0, 4))
+        self.btn_add_accessory = ttk.Button(btn_row, text="新增", command=self._add_accessory)
+        self.btn_add_accessory.pack(side="left", padx=2)
+        self.btn_edit_accessory = ttk.Button(btn_row, text="编辑", command=self._edit_accessory)
+        self.btn_edit_accessory.pack(side="left", padx=2)
+        self.btn_del_accessory = ttk.Button(btn_row, text="删除", command=self._delete_accessory)
+        self.btn_del_accessory.pack(side="left", padx=2)
+        self.btn_import_accessories = ttk.Button(btn_row, text="导入", command=self._import_accessories)
+        self.btn_import_accessories.pack(side="left", padx=2)
+        self.btn_export_accessories = ttk.Button(btn_row, text="导出选中", command=self._export_accessories)
+        self.btn_export_accessories.pack(side="right", padx=2)
+        self.btn_refresh_accessories = ttk.Button(btn_row, text="刷新", command=self._refresh_accessories)
+        self.btn_refresh_accessories.pack(side="right", padx=2)
+
+        self.acc_status_label = ttk.Label(btn_row, text="", foreground="#2980b9")
+        self.acc_status_label.pack(side="right", padx=6)
+
+        tree_frame = ttk.Frame(frame)
+        tree_frame.pack(fill="both", expand=True)
+        cols = ("id", "device_id", "device_name", "name", "type", "quantity", "serial_no",
+                "storage_location", "expiry_date", "responsible_person", "remark", "created_at", "created_by")
+        self.accessory_tree = ttk.Treeview(tree_frame, columns=cols,
+                                           show="headings", height=10, selectmode="extended")
+        self.accessory_tree.heading("id", text="ID")
+        self.accessory_tree.heading("device_id", text="设备ID")
+        self.accessory_tree.heading("device_name", text="设备名称")
+        self.accessory_tree.heading("name", text="名称")
+        self.accessory_tree.heading("type", text="类型")
+        self.accessory_tree.heading("quantity", text="数量")
+        self.accessory_tree.heading("serial_no", text="编号")
+        self.accessory_tree.heading("storage_location", text="存放位置")
+        self.accessory_tree.heading("expiry_date", text="到期日")
+        self.accessory_tree.heading("responsible_person", text="责任人")
+        self.accessory_tree.heading("remark", text="备注")
+        self.accessory_tree.heading("created_at", text="创建时间")
+        self.accessory_tree.heading("created_by", text="创建人")
+        self.accessory_tree.column("id", width=80, anchor="center")
+        self.accessory_tree.column("device_id", width=80, anchor="center")
+        self.accessory_tree.column("device_name", width=140, anchor="w")
+        self.accessory_tree.column("name", width=140, anchor="w")
+        self.accessory_tree.column("type", width=60, anchor="center")
+        self.accessory_tree.column("quantity", width=50, anchor="center")
+        self.accessory_tree.column("serial_no", width=100, anchor="w")
+        self.accessory_tree.column("storage_location", width=100, anchor="w")
+        self.accessory_tree.column("expiry_date", width=100, anchor="center")
+        self.accessory_tree.column("responsible_person", width=80, anchor="w")
+        self.accessory_tree.column("remark", width=150, anchor="w")
+        self.accessory_tree.column("created_at", width=140, anchor="w")
+        self.accessory_tree.column("created_by", width=80, anchor="w")
+        avsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.accessory_tree.yview)
+        self.accessory_tree.configure(yscrollcommand=avsb.set)
+        self.accessory_tree.pack(side="left", fill="both", expand=True)
+        avsb.pack(side="right", fill="y")
+        self.accessory_tree.bind("<<TreeviewSelect>>", self._on_accessory_selected)
+
     def _build_records_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="借用记录", padding=6)
         frame.pack(fill="both", expand=True)
@@ -1856,10 +2081,12 @@ class App:
         self._restore_last_maintenance_filter()
         self._restore_last_inventory_filter()
         self._restore_last_handoff_filter()
+        self._restore_last_accessory_filter()
         self._refresh_records()
         self._refresh_maintenance_logs()
         self._refresh_inventory_sessions()
         self._refresh_handoff_records()
+        self._refresh_accessories()
         self._refresh_export_dir()
         self._apply_permissions()
 
@@ -1908,6 +2135,318 @@ class App:
         action_label = HANDOFF_ACTION_LABELS.get(
             self._handoff_filter_action, HANDOFF_ACTION_LABELS["all"])
         self.handoff_action_var.set(action_label)
+
+    def _restore_last_accessory_filter(self):
+        saved = self.manager.get_last_accessory_filter()
+        if saved:
+            self._accessory_filter_device = saved.get("device_id", "")
+            self._accessory_filter_type = saved.get("type_filter", "all")
+            self._accessory_filter_keyword = saved.get("keyword", "")
+            self._accessory_filter_serial_no = saved.get("serial_no", "")
+            self._accessory_filter_expiry_from = saved.get("expiry_from", "")
+            self._accessory_filter_expiry_to = saved.get("expiry_to", "")
+            self._accessory_filter_responsible_person = saved.get("responsible_person", "")
+        self.acc_device_var.set(self._accessory_filter_device)
+        type_label = ACCESSORY_TYPE_LABELS.get(self._accessory_filter_type, ACCESSORY_TYPE_LABELS["all"])
+        self.acc_type_var.set(type_label)
+        self.acc_keyword_var.set(self._accessory_filter_keyword)
+        self.acc_serial_var.set(self._accessory_filter_serial_no)
+        self.acc_expiry_from_var.set(self._accessory_filter_expiry_from)
+        self.acc_expiry_to_var.set(self._accessory_filter_expiry_to)
+        self.acc_resp_var.set(self._accessory_filter_responsible_person)
+
+    def _label_to_accessory_type_key(self, label: str) -> str:
+        for k, v in ACCESSORY_TYPE_LABELS.items():
+            if v == label:
+                return k
+        return "all"
+
+    def _on_accessory_filter_apply(self):
+        self._accessory_filter_device = self.acc_device_var.get().strip()
+        self._accessory_filter_type = self._label_to_accessory_type_key(self.acc_type_var.get())
+        self._accessory_filter_keyword = self.acc_keyword_var.get().strip()
+        self._accessory_filter_serial_no = self.acc_serial_var.get().strip()
+        self._accessory_filter_expiry_from = self.acc_expiry_from_var.get().strip()
+        self._accessory_filter_expiry_to = self.acc_expiry_to_var.get().strip()
+        self._accessory_filter_responsible_person = self.acc_resp_var.get().strip()
+        self.manager.save_accessory_filter({
+            "device_id": self._accessory_filter_device,
+            "type_filter": self._accessory_filter_type,
+            "keyword": self._accessory_filter_keyword,
+            "serial_no": self._accessory_filter_serial_no,
+            "expiry_from": self._accessory_filter_expiry_from,
+            "expiry_to": self._accessory_filter_expiry_to,
+            "responsible_person": self._accessory_filter_responsible_person,
+        })
+        self._refresh_accessories()
+        self.status_var.set("附件台账筛选已应用")
+
+    def _on_accessory_filter_reset(self):
+        self._accessory_filter_device = ""
+        self._accessory_filter_type = "all"
+        self._accessory_filter_keyword = ""
+        self._accessory_filter_serial_no = ""
+        self._accessory_filter_expiry_from = ""
+        self._accessory_filter_expiry_to = ""
+        self._accessory_filter_responsible_person = ""
+        self.acc_device_var.set("")
+        self.acc_type_var.set(ACCESSORY_TYPE_LABELS["all"])
+        self.acc_keyword_var.set("")
+        self.acc_serial_var.set("")
+        self.acc_expiry_from_var.set("")
+        self.acc_expiry_to_var.set("")
+        self.acc_resp_var.set("")
+        self.manager.save_accessory_filter({})
+        self._refresh_accessories()
+        self.status_var.set("附件台账筛选已重置")
+
+    def _on_accessory_selected(self, _event=None):
+        sel = self.accessory_tree.selection()
+        self._selected_accessory_ids = list(sel)
+
+    def _refresh_accessories(self):
+        if not (self.manager.has_permission("view_accessory_all")
+                or self.manager.has_permission("view_own_accessory")):
+            self.accessory_tree.delete(*self.accessory_tree.get_children())
+            self.acc_status_label.config(text="【无权限】", foreground="#c0392b")
+            return
+        try:
+            all_accs = self.manager.get_accessories()
+        except BusinessError:
+            self.accessory_tree.delete(*self.accessory_tree.get_children())
+            self.acc_status_label.config(text="【无权限】", foreground="#c0392b")
+            return
+        filtered = self.manager.filter_accessories(
+            all_accs,
+            device_id=self._accessory_filter_device,
+            type_filter=self._accessory_filter_type,
+            keyword=self._accessory_filter_keyword,
+            serial_no=self._accessory_filter_serial_no,
+            expiry_from=self._accessory_filter_expiry_from,
+            expiry_to=self._accessory_filter_expiry_to,
+            responsible_person=self._accessory_filter_responsible_person,
+        )
+        current_selection = list(self.accessory_tree.selection())
+        if current_selection:
+            self._selected_accessory_ids = current_selection
+        self.accessory_tree.delete(*self.accessory_tree.get_children())
+        visible_ids = set()
+        for a in sorted(filtered, key=lambda x: x.created_at, reverse=True):
+            self.accessory_tree.insert("", "end", iid=a.id, values=(
+                a.id, a.device_id, a.device_name, a.name, a.type, a.quantity,
+                a.serial_no or "-", a.storage_location or "-",
+                a.expiry_date or "-", a.responsible_person or "-",
+                a.remark or "-", a.created_at, a.created_by or "-"
+            ), tags=(a.type,))
+            visible_ids.add(a.id)
+        to_restore = [aid for aid in self._selected_accessory_ids if aid in visible_ids]
+        if to_restore:
+            try:
+                self.accessory_tree.selection_set(to_restore)
+            except Exception:
+                pass
+        total = len(all_accs)
+        shown = len(filtered)
+        parts = [f"显示 {shown}/{total} 条"]
+        if self._accessory_filter_type != "all":
+            parts.append(f"（{ACCESSORY_TYPE_LABELS[self._accessory_filter_type]}）")
+        if self._accessory_filter_device:
+            parts.append(f"设备={self._accessory_filter_device}")
+        if self._accessory_filter_keyword:
+            parts.append(f"关键词={self._accessory_filter_keyword}")
+        if shown == 0 and (self._accessory_filter_type != "all" or self._accessory_filter_device
+                           or self._accessory_filter_keyword or self._accessory_filter_serial_no
+                           or self._accessory_filter_expiry_from or self._accessory_filter_expiry_to
+                           or self._accessory_filter_responsible_person):
+            parts.append("- 该筛选下无记录")
+        self.acc_status_label.config(text="  ".join(parts), foreground="#2980b9")
+
+    def _add_accessory(self):
+        if not self.manager.has_permission("add_accessory"):
+            messagebox.showerror("无权限", "当前角色不能新增附件/证照。")
+            return
+        dlg = AccessoryDialog(self.root, self.manager)
+        self.root.wait_window(dlg)
+        if dlg.result:
+            try:
+                self.manager.add_accessory(**dlg.result)
+                self._refresh_accessories()
+                self.status_var.set("附件/证照已新增")
+            except BusinessError as e:
+                messagebox.showerror("错误", str(e))
+
+    def _edit_accessory(self):
+        if not self.manager.has_permission("edit_accessory"):
+            messagebox.showerror("无权限", "当前角色不能编辑附件/证照。")
+            return
+        if not self._selected_accessory_ids:
+            messagebox.showinfo("提示", "请先选择要编辑的附件/证照")
+            return
+        if len(self._selected_accessory_ids) > 1:
+            messagebox.showinfo("提示", "一次只能编辑一条记录")
+            return
+        acc_id = self._selected_accessory_ids[0]
+        acc = self.manager.find_accessory(acc_id)
+        if not acc:
+            return
+        can_mod, reason = self.manager.can_modify_accessory_device(acc.device_id)
+        if not can_mod:
+            messagebox.showerror("错误", reason)
+            return
+        dlg = AccessoryDialog(self.root, self.manager, acc)
+        self.root.wait_window(dlg)
+        if dlg.result:
+            try:
+                self.manager.update_accessory(acc_id, **dlg.result)
+                self._refresh_accessories()
+                self.status_var.set("附件/证照已更新")
+            except BusinessError as e:
+                messagebox.showerror("错误", str(e))
+
+    def _delete_accessory(self):
+        if not self.manager.has_permission("delete_accessory"):
+            messagebox.showerror("无权限", "当前角色不能删除附件/证照。")
+            return
+        if not self._selected_accessory_ids:
+            messagebox.showinfo("提示", "请先选择要删除的附件/证照")
+            return
+        for acc_id in self._selected_accessory_ids:
+            acc = self.manager.find_accessory(acc_id)
+            if not acc:
+                continue
+            can_mod, reason = self.manager.can_modify_accessory_device(acc.device_id)
+            if not can_mod:
+                messagebox.showerror("错误", f"记录【{acc.name}】：{reason}")
+                return
+        if not messagebox.askyesno("确认", f"确定删除选中的 {len(self._selected_accessory_ids)} 条附件/证照记录?"):
+            return
+        success = 0
+        for acc_id in self._selected_accessory_ids:
+            try:
+                self.manager.delete_accessory(acc_id)
+                success += 1
+            except BusinessError as e:
+                messagebox.showerror("错误", str(e))
+        self._selected_accessory_ids = []
+        self._refresh_accessories()
+        self.status_var.set(f"已删除 {success} 条附件/证照记录")
+
+    def _import_accessories(self):
+        if not self.manager.has_permission("import_accessories"):
+            messagebox.showerror("无权限", "当前角色不能导入附件/证照。")
+            return
+        if (self.manager.current_user and
+                self.manager.current_user.role == UserRole.BORROWER):
+            messagebox.showerror("无权限",
+                                 "借用人不能进行批量导入操作。\n"
+                                 "请联系管理员或验收人处理。")
+            return
+        initial = (self.manager.config.last_import_dir
+                   or self.manager.config.export_dir
+                   or os.path.expanduser("~"))
+        filepath = filedialog.askopenfilename(
+            title="选择要导入的附件/证照文件",
+            initialdir=initial,
+            filetypes=[
+                ("CSV / JSON 数据文件", "*.csv *.json"),
+                ("CSV 表格", "*.csv"),
+                ("JSON 数据", "*.json"),
+                ("所有文件", "*.*"),
+            ]
+        )
+        if not filepath:
+            return
+        try:
+            ok, msg, summary = self.manager.precheck_accessory_import_file(filepath)
+        except BusinessError as e:
+            messagebox.showerror("错误", str(e))
+            return
+        if not ok:
+            messagebox.showerror("预检失败", f"文件无法解析：\n{msg}")
+            return
+        dlg = ImportPrecheckDialog(self.root, filepath, summary)
+        self.root.wait_window(dlg)
+        if not dlg.confirmed:
+            return
+        try:
+            ok, msg, sc, fc = self.manager.commit_accessory_import(filepath)
+        except BusinessError as e:
+            messagebox.showerror("错误", str(e))
+            return
+        self._refresh_accessories()
+        if ok:
+            messagebox.showinfo(
+                "导入完成",
+                f"{msg}\n\n"
+                f"文件：{os.path.basename(filepath)}\n"
+                f"总数：{summary.total}，成功：{sc}，失败：{fc}"
+            )
+            self.status_var.set(f"附件/证照批量导入完成：成功 {sc}，失败 {fc}")
+        else:
+            messagebox.showerror(
+                "导入失败（已回滚）",
+                f"{msg}\n\n"
+                f"所有记录均未写入，数据保持不变。"
+            )
+
+    def _export_accessories(self):
+        if not self.manager.has_permission("export_accessories"):
+            messagebox.showerror("无权限", "当前角色不能导出附件/证照。")
+            return
+        sel = self.accessory_tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先在附件台账列表中选择要导出的记录（支持多选）")
+            return
+        if not self._check_export_dir():
+            return
+        type_desc = ACCESSORY_TYPE_LABELS.get(self._accessory_filter_type, "全部")
+        default_name = f"附件台账_{type_desc}_{_now_str().replace(':', '-').replace(' ', '_')}"
+        filepath = filedialog.asksaveasfilename(
+            title="导出附件/证照",
+            initialdir=self.manager.config.export_dir,
+            initialfile=default_name,
+            defaultextension=".csv",
+            filetypes=[("CSV 表格", "*.csv"), ("JSON 数据", "*.json")]
+        )
+        if not filepath:
+            return
+        if not filepath.startswith(self.manager.config.export_dir):
+            if not messagebox.askyesno("目录不匹配",
+                                       f"所选路径不在设置的导出目录下。\n"
+                                       f"导出目录: {self.manager.config.export_dir}\n"
+                                       f"确定继续导出？"):
+                return
+        filter_info = {
+            "description": f"附件/证照（{type_desc}）",
+            "筛选-类型": type_desc,
+            "筛选-设备ID/名称": self._accessory_filter_device or "（未指定）",
+            "筛选-关键词": self._accessory_filter_keyword or "（未指定）",
+            "筛选-编号": self._accessory_filter_serial_no or "（未指定）",
+            "筛选-到期起": self._accessory_filter_expiry_from or "（未指定）",
+            "筛选-到期止": self._accessory_filter_expiry_to or "（未指定）",
+            "筛选-责任人": self._accessory_filter_responsible_person or "（未指定）",
+            "导出时间": _now_str(),
+            "操作人": (f"{self.manager.current_user.display_name} "
+                        f"({self.manager.current_user.username})"
+                        if self.manager.current_user else "unknown"),
+            "角色": self.manager.current_user.role if self.manager.current_user else "unknown",
+            "可见记录数": len(self.manager.filter_accessories(
+                self.manager.accessories,
+                device_id=self._accessory_filter_device,
+                type_filter=self._accessory_filter_type,
+                keyword=self._accessory_filter_keyword,
+                serial_no=self._accessory_filter_serial_no,
+                expiry_from=self._accessory_filter_expiry_from,
+                expiry_to=self._accessory_filter_expiry_to,
+                responsible_person=self._accessory_filter_responsible_person,
+            )),
+            "本次选中导出数": len(sel),
+        }
+        ok, msg = self.manager.export_accessories(list(sel), filepath, filter_info)
+        if ok:
+            messagebox.showinfo("成功", f"{msg}\n\n共导出 {len(sel)} 条附件/证照记录")
+        else:
+            messagebox.showerror("失败", msg)
 
     def _refresh_user_combo(self):
         values = [f"{u.username} ({u.display_name} - {u.role})" for u in self.manager.users]
@@ -2078,6 +2617,12 @@ class App:
             "export_handoff": [self.btn_handoff_export],
             "confirm_handoff": [self.btn_handoff_confirm],
             "object_handoff": [self.btn_handoff_confirm],
+            "view_accessory_all": [self.btn_acc_apply, self.btn_acc_reset, self.btn_refresh_accessories],
+            "add_accessory": [self.btn_add_accessory],
+            "edit_accessory": [self.btn_edit_accessory],
+            "delete_accessory": [self.btn_del_accessory],
+            "import_accessories": [self.btn_import_accessories],
+            "export_accessories": [self.btn_export_accessories],
         }
         for perm, widgets in perm_map.items():
             enabled = self.manager.has_permission(perm)
@@ -2110,6 +2655,22 @@ class App:
             self.handoff_action_var.set(HANDOFF_ACTION_LABELS["all"])
             self.handoff_tree.delete(*self.handoff_tree.get_children())
             self.handoff_status_label.config(text="【无权限】", foreground="#c0392b")
+
+        if not (self.manager.has_permission("view_accessory_all")
+                or self.manager.has_permission("view_own_accessory")):
+            self.acc_device_var.set("")
+            self.acc_type_var.set(ACCESSORY_TYPE_LABELS["all"])
+            self.acc_keyword_var.set("")
+            self.acc_serial_var.set("")
+            self.acc_expiry_from_var.set("")
+            self.acc_expiry_to_var.set("")
+            self.acc_resp_var.set("")
+            self.accessory_tree.delete(*self.accessory_tree.get_children())
+            self.acc_status_label.config(text="【无权限】", foreground="#c0392b")
+
+        if (self.manager.current_user and
+                self.manager.current_user.role == UserRole.BORROWER):
+            self.btn_edit_accessory.config(state="disabled")
 
     def _on_user_changed(self, _event=None):
         value = self.user_var.get()
@@ -2272,6 +2833,9 @@ class App:
             self._refresh_devices()
             self._refresh_records()
             self.status_var.set("借出登记完成")
+            acc_hint = self.manager.get_accessory_check_hint(device.id)
+            if acc_hint:
+                messagebox.showinfo("附件核对", acc_hint, parent=self.root)
 
     def _return_device(self):
         if not self._selected_record_id:
@@ -2290,6 +2854,9 @@ class App:
             self._refresh_devices()
             self._refresh_records()
             self.status_var.set("归还已提交，等待验收")
+            acc_hint = self.manager.get_accessory_check_hint(record.device_id)
+            if acc_hint:
+                messagebox.showinfo("附件核对", acc_hint, parent=self.root)
 
     def _inspect_device(self):
         if not self._selected_record_id:

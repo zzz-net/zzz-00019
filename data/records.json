@@ -44,5 +44,97 @@
       }
     ],
     "remark": "季度会议使用"
+  },
+  {
+    "id": "fb91542d",
+    "device_id": "a75e2d52",
+    "device_name": "爱普生投影仪 CB-X05",
+    "borrower_id": "a2cd09e3",
+    "borrower_name": "张三",
+    "borrower_department": "研发部",
+    "borrow_time": "2026-06-08 19:00:38",
+    "expected_return_time": "2026-06-10 18:00:00",
+    "actual_return_time": "",
+    "status": "借出中",
+    "accessories_check_out": [
+      {
+        "name": "电源适配器",
+        "required": true,
+        "present": true
+      },
+      {
+        "name": "HDMI线",
+        "required": true,
+        "present": true
+      },
+      {
+        "name": "VGA线",
+        "required": false,
+        "present": true
+      },
+      {
+        "name": "遥控器",
+        "required": true,
+        "present": true
+      }
+    ],
+    "accessories_check_in": [],
+    "check_out_operator": "admin",
+    "check_in_operator": "",
+    "inspect_operator": "",
+    "inspect_remark": "",
+    "close_operator": "",
+    "history": [
+      {
+        "timestamp": "2026-06-08 19:00:38",
+        "from_status": "可借出",
+        "to_status": "借出中",
+        "operator": "admin",
+        "operator_role": "管理员",
+        "remark": "gui-review-borrow"
+      }
+    ],
+    "remark": "gui-review-borrow"
+  },
+  {
+    "id": "0d7638cf",
+    "device_id": "54b3dab8",
+    "device_name": "索尼录音笔 ICD-PX470",
+    "borrower_id": "a2cd09e3",
+    "borrower_name": "张三",
+    "borrower_department": "研发部",
+    "borrow_time": "2026-06-08 19:00:53",
+    "expected_return_time": "2026-06-10 18:00:00",
+    "actual_return_time": "",
+    "status": "借出中",
+    "accessories_check_out": [
+      {
+        "name": "USB充电线",
+        "required": true,
+        "present": true
+      },
+      {
+        "name": "立体声麦克风",
+        "required": false,
+        "present": true
+      }
+    ],
+    "accessories_check_in": [],
+    "check_out_operator": "admin",
+    "check_in_operator": "",
+    "inspect_operator": "",
+    "inspect_remark": "",
+    "close_operator": "",
+    "history": [
+      {
+        "timestamp": "2026-06-08 19:00:53",
+        "from_status": "可借出",
+        "to_status": "借出中",
+        "operator": "admin",
+        "operator_role": "管理员",
+        "remark": "gui-review-borrow"
+      }
+    ],
+    "remark": "gui-review-borrow"
   }
 ]

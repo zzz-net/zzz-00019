@@ -47,17 +47,23 @@ class UserRole:
                 "view_inventory", "export_inventory",
                 "view_handoff_all", "create_handoff", "edit_handoff",
                 "complete_handoff", "export_handoff",
-                "view_own_handoff", "confirm_handoff", "object_handoff"],
+                "view_own_handoff", "confirm_handoff", "object_handoff",
+                "view_accessory_all", "add_accessory", "edit_accessory",
+                "delete_accessory", "import_accessories", "export_accessories",
+                "view_own_accessory"],
         BORROWER: ["borrow_device", "view_own", "export_data",
                    "view_own_inventory",
-                   "view_own_handoff", "confirm_handoff", "object_handoff"],
+                   "view_own_handoff", "confirm_handoff", "object_handoff",
+                   "view_own_accessory"],
         INSPECTOR: ["inspect_return", "return_device", "close_record",
                     "view_all", "export_data", "import_records",
                     "set_reminder_days",
                     "view_maintenance", "export_maintenance",
                     "fill_inventory", "view_inventory", "export_inventory",
                     "view_handoff_all", "export_handoff",
-                    "view_own_handoff", "confirm_handoff", "object_handoff"],
+                    "view_own_handoff", "confirm_handoff", "object_handoff",
+                    "view_accessory_all", "export_accessories",
+                    "view_own_accessory"],
     }
 
     @classmethod
@@ -387,6 +393,40 @@ class HandoffRecord:
         return cls(**d)
 
 
+class AccessoryType:
+    ACCESSORY = "附件"
+    CERTIFICATE = "证照"
+
+    ALL_TYPES = [ACCESSORY, CERTIFICATE]
+
+
+@dataclass
+class DeviceAccessory:
+    id: str = field(default_factory=_new_id)
+    device_id: str = ""
+    device_name: str = ""
+    name: str = ""
+    type: str = AccessoryType.ACCESSORY
+    quantity: int = 1
+    serial_no: str = ""
+    storage_location: str = ""
+    expiry_date: str = ""
+    responsible_person: str = ""
+    remark: str = ""
+    created_at: str = field(default_factory=_now_str)
+    created_by: str = ""
+    created_by_role: str = ""
+    updated_at: str = ""
+    updated_by: str = ""
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict):
+        return cls(**d)
+
+
 @dataclass
 class AppConfig:
     export_dir: str = ""
@@ -401,6 +441,7 @@ class AppConfig:
     last_inventory_filter: dict = field(default_factory=dict)
     last_active_inventory_session_id: str = ""
     last_handoff_filter: dict = field(default_factory=dict)
+    last_accessory_filter: dict = field(default_factory=dict)
 
     def to_dict(self):
         return asdict(self)

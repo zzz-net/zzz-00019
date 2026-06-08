@@ -1,0 +1,27 @@
+[
+  {
+    "username": "admin",
+    "role": "管理员",
+    "display_name": "系统管理员"
+  },
+  {
+    "username": "zhangsan",
+    "role": "借用人",
+    "display_name": "张三"
+  },
+  {
+    "username": "lisi",
+    "role": "借用人",
+    "display_name": "李四"
+  },
+  {
+    "username": "wangwu",
+    "role": "验收人",
+    "display_name": "王五"
+  },
+  {
+    "username": "zhaoliu",
+    "role": "验收人",
+    "display_name": "赵六"
+  }
+]

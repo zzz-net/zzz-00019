@@ -7,7 +7,8 @@ from models import (
     DeviceStatus, RecordStatus, UserRole, _now_str,
     ImportPrecheckSummary, ImportLogEntry, MaintenanceRecord,
     InventorySession, InventoryItem, InventoryStatus, InventoryItemResult,
-    HandoffRecord, HandoffAction, HandoffStatus
+    HandoffRecord, HandoffAction, HandoffStatus,
+    DeviceAccessory, AccessoryType
 )
 import storage
 
@@ -25,6 +26,7 @@ class EquipmentManager:
         self.maintenance_logs: List[MaintenanceRecord] = []
         self.inventory_sessions: List[InventorySession] = []
         self.handoff_records: List[HandoffRecord] = []
+        self.accessories: List[DeviceAccessory] = []
         self.config = storage.AppConfig()
         self.current_user: Optional[User] = None
         self._records_snapshot_at_last_maintenance: Dict[str, str] = {}
@@ -39,6 +41,7 @@ class EquipmentManager:
         self.maintenance_logs = storage.load_maintenance_logs()
         self.inventory_sessions = storage.load_inventory_sessions()
         self.handoff_records = storage.load_handoff_records()
+        self.accessories = storage.load_accessories()
         self.config = storage.load_config()
         self._records_snapshot_at_last_maintenance = dict(
             self.config.maintenance_records_snapshot or {}
@@ -54,6 +57,7 @@ class EquipmentManager:
         storage.save_maintenance_logs(self.maintenance_logs)
         storage.save_inventory_sessions(self.inventory_sessions)
         storage.save_handoff_records(self.handoff_records)
+        storage.save_accessories(self.accessories)
         storage.save_config(self.config)
 
     def find_user(self, username: str) -> Optional[User]:
@@ -1658,3 +1662,439 @@ class EquipmentManager:
         if not ok:
             return False, f"导出失败，目标文件无法写入：{filepath}"
         return True, f"导出成功：{filepath}"
+
+    def find_accessory(self, accessory_id: str) -> Optional[DeviceAccessory]:
+        return next((a for a in self.accessories if a.id == accessory_id), None)
+
+    def get_accessories_by_device(self, device_id: str) -> List[DeviceAccessory]:
+        return [a for a in self.accessories if a.device_id == device_id]
+
+    def _get_visible_device_ids_for_current_user(self) -> set:
+        if not self.current_user:
+            return set()
+        if self.current_user.role in (UserRole.ADMIN, UserRole.INSPECTOR):
+            return {d.id for d in self.devices}
+        name = self.current_user.display_name
+        uid = self.current_user.username
+        device_ids = set()
+        for r in self.records:
+            if (r.borrower_name == name or r.borrower_id == uid):
+                device_ids.add(r.device_id)
+        return device_ids
+
+    def get_accessories(self) -> List[DeviceAccessory]:
+        if not self.current_user:
+            return []
+        if self.has_permission("view_accessory_all"):
+            return list(self.accessories)
+        if self.has_permission("view_own_accessory"):
+            visible_dev_ids = self._get_visible_device_ids_for_current_user()
+            return [a for a in self.accessories if a.device_id in visible_dev_ids]
+        return []
+
+    def can_modify_accessory_device(self, device_id: str) -> Tuple[bool, str]:
+        device = self.find_device(device_id)
+        if not device:
+            return False, "设备不存在"
+        if device.status == DeviceStatus.MAINTENANCE:
+            if self.current_user and self.current_user.role == UserRole.BORROWER:
+                return False, f"设备【{device.name}】正在维修中，借用人不能修改其附件"
+        return True, ""
+
+    def add_accessory(self, device_id: str, name: str,
+                      type: str = AccessoryType.ACCESSORY,
+                      quantity: int = 1, serial_no: str = "",
+                      storage_location: str = "", expiry_date: str = "",
+                      responsible_person: str = "", remark: str = "") -> DeviceAccessory:
+        self._require_permission("add_accessory")
+        if not device_id or not str(device_id).strip():
+            raise BusinessError("必须选择设备")
+        device = self.find_device(device_id.strip())
+        if not device:
+            raise BusinessError("设备不存在")
+        can_mod, reason = self.can_modify_accessory_device(device.id)
+        if not can_mod:
+            raise BusinessError(reason)
+        if not name or not str(name).strip():
+            raise BusinessError("附件/证照名称不能为空")
+        try:
+            qty = int(quantity)
+        except (ValueError, TypeError):
+            raise BusinessError("数量必须是正整数")
+        if qty <= 0:
+            raise BusinessError("数量必须大于 0")
+        if expiry_date and expiry_date.strip():
+            dt = self._parse_datetime(expiry_date.strip())
+            if not dt:
+                raise BusinessError("到期日格式错误，应为 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS")
+        if serial_no and serial_no.strip():
+            for a in self.accessories:
+                if a.serial_no == serial_no.strip():
+                    raise BusinessError(f"编号【{serial_no.strip()}】已存在，请使用不同编号")
+
+        acc = DeviceAccessory(
+            device_id=device.id,
+            device_name=device.name,
+            name=name.strip(),
+            type=type if type in AccessoryType.ALL_TYPES else AccessoryType.ACCESSORY,
+            quantity=qty,
+            serial_no=serial_no.strip(),
+            storage_location=storage_location.strip(),
+            expiry_date=expiry_date.strip() if expiry_date else "",
+            responsible_person=responsible_person.strip(),
+            remark=remark.strip(),
+            created_by=self.current_user.username if self.current_user else "",
+            created_by_role=self.current_user.role if self.current_user else "",
+        )
+        self.accessories.append(acc)
+        self.save_all()
+        return acc
+
+    def update_accessory(self, accessory_id: str, **kwargs) -> DeviceAccessory:
+        self._require_permission("edit_accessory")
+        acc = self.find_accessory(accessory_id)
+        if not acc:
+            raise BusinessError("附件/证照不存在")
+        can_mod, reason = self.can_modify_accessory_device(acc.device_id)
+        if not can_mod:
+            raise BusinessError(reason)
+
+        if "quantity" in kwargs:
+            try:
+                qty = int(kwargs["quantity"])
+            except (ValueError, TypeError):
+                raise BusinessError("数量必须是正整数")
+            if qty <= 0:
+                raise BusinessError("数量必须大于 0")
+            kwargs["quantity"] = qty
+
+        if "expiry_date" in kwargs and kwargs["expiry_date"]:
+            dt = self._parse_datetime(str(kwargs["expiry_date"]).strip())
+            if not dt:
+                raise BusinessError("到期日格式错误，应为 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS")
+
+        if "serial_no" in kwargs and kwargs["serial_no"]:
+            new_serial = str(kwargs["serial_no"]).strip()
+            for a in self.accessories:
+                if a.id != acc.id and a.serial_no == new_serial:
+                    raise BusinessError(f"编号【{new_serial}】已存在，请使用不同编号")
+            kwargs["serial_no"] = new_serial
+
+        if "device_id" in kwargs:
+            new_device_id = str(kwargs["device_id"]).strip()
+            if new_device_id != acc.device_id:
+                new_device = self.find_device(new_device_id)
+                if not new_device:
+                    raise BusinessError("目标设备不存在")
+                can_mod2, reason2 = self.can_modify_accessory_device(new_device.id)
+                if not can_mod2:
+                    raise BusinessError(reason2)
+                kwargs["device_id"] = new_device.id
+                kwargs["device_name"] = new_device.name
+
+        for k, v in kwargs.items():
+            if hasattr(acc, k):
+                setattr(acc, k, v)
+        acc.updated_at = _now_str()
+        acc.updated_by = self.current_user.username if self.current_user else ""
+        self.save_all()
+        return acc
+
+    def delete_accessory(self, accessory_id: str):
+        self._require_permission("delete_accessory")
+        acc = self.find_accessory(accessory_id)
+        if not acc:
+            raise BusinessError("附件/证照不存在")
+        can_mod, reason = self.can_modify_accessory_device(acc.device_id)
+        if not can_mod:
+            raise BusinessError(reason)
+        self.accessories.remove(acc)
+        self.save_all()
+
+    def filter_accessories(self, accessories: List[DeviceAccessory],
+                           device_id: str = "",
+                           type_filter: str = "all",
+                           keyword: str = "",
+                           serial_no: str = "",
+                           expiry_from: str = "",
+                           expiry_to: str = "",
+                           responsible_person: str = "") -> List[DeviceAccessory]:
+        result = list(accessories)
+        if device_id and device_id.strip():
+            did = device_id.strip()
+            result = [a for a in result if a.device_id == did]
+        if type_filter and type_filter != "all":
+            result = [a for a in result if a.type == type_filter]
+        if serial_no and serial_no.strip():
+            sn = serial_no.strip().lower()
+            result = [a for a in result if sn in (a.serial_no or "").lower()]
+        if responsible_person and responsible_person.strip():
+            rp = responsible_person.strip()
+            result = [a for a in result if rp in (a.responsible_person or "")]
+        if expiry_from and expiry_from.strip():
+            dt_from = self._parse_datetime(expiry_from.strip())
+            if dt_from:
+                result = [a for a in result
+                          if a.expiry_date and self._parse_datetime(a.expiry_date)
+                          and self._parse_datetime(a.expiry_date) >= dt_from]
+        if expiry_to and expiry_to.strip():
+            dt_to = self._parse_datetime(expiry_to.strip())
+            if dt_to:
+                result = [a for a in result
+                          if a.expiry_date and self._parse_datetime(a.expiry_date)
+                          and self._parse_datetime(a.expiry_date) <= dt_to]
+        if keyword and keyword.strip():
+            kw = keyword.strip().lower()
+            result = [a for a in result
+                      if kw in a.name.lower()
+                      or kw in (a.serial_no or "").lower()
+                      or kw in (a.device_name or "").lower()
+                      or kw in a.device_id.lower()
+                      or kw in (a.storage_location or "").lower()
+                      or kw in (a.responsible_person or "").lower()]
+        return result
+
+    def save_accessory_filter(self, flt: dict):
+        try:
+            self.config.last_accessory_filter = dict(flt) if flt else {}
+            self.save_all()
+        except Exception:
+            pass
+
+    def get_last_accessory_filter(self) -> dict:
+        return dict(self.config.last_accessory_filter or {})
+
+    def precheck_accessory_import_file(self, filepath: str) -> Tuple[bool, str, ImportPrecheckSummary]:
+        self._require_permission("import_accessories")
+
+        ok, msg, rows, fmt = storage.parse_import_file(filepath)
+        if not ok:
+            return False, msg, ImportPrecheckSummary()
+
+        summary = ImportPrecheckSummary(total=len(rows))
+        seen_serials = set()
+        existing_serials = {a.serial_no for a in self.accessories if a.serial_no}
+
+        for row in rows:
+            issues_for_row = []
+
+            missing_fields = []
+            for f in storage.ACCESSORY_IMPORT_REQUIRED_FIELDS:
+                val = row.get(f, "")
+                if val is None or (isinstance(val, str) and not val.strip()):
+                    missing_fields.append(f)
+            if missing_fields:
+                summary.field_missing += 1
+                issues_for_row.append(self._make_row_issue(
+                    row, "字段缺失",
+                    f"缺少必填字段：{', '.join(missing_fields)}"
+                ))
+
+            device = None
+            if not issues_for_row or "device_id" not in missing_fields:
+                device_id = str(row.get("device_id", "")).strip()
+                device = self.find_device(device_id)
+                if not device:
+                    summary.device_not_found += 1
+                    issues_for_row.append(self._make_row_issue(
+                        row, "设备不存在",
+                        f"设备ID【{device_id}】在系统中不存在"
+                    ))
+
+            qty_raw = row.get("quantity", "")
+            if qty_raw is not None and str(qty_raw).strip():
+                try:
+                    qty = int(str(qty_raw).strip())
+                    if qty <= 0:
+                        raise ValueError
+                except (ValueError, TypeError):
+                    summary.issues.append(self._make_row_issue(
+                        row, "数量非法",
+                        f"数量【{qty_raw}】不是正整数"
+                    ))
+                    issues_for_row.append("数量非法")
+
+            expiry_raw = str(row.get("expiry_date", "")).strip()
+            if expiry_raw:
+                dt = self._parse_datetime(expiry_raw)
+                if not dt:
+                    summary.issues.append(self._make_row_issue(
+                        row, "日期格式错误",
+                        f"到期日【{expiry_raw}】格式错误，应为 YYYY-MM-DD"
+                    ))
+                    issues_for_row.append("日期格式错误")
+
+            serial_raw = str(row.get("serial_no", "")).strip()
+            if serial_raw:
+                if serial_raw in seen_serials:
+                    summary.duplicate += 1
+                    issues_for_row.append(self._make_row_issue(
+                        row, "重复编号",
+                        f"同一文件内编号【{serial_raw}】重复"
+                    ))
+                elif serial_raw in existing_serials:
+                    summary.duplicate += 1
+                    issues_for_row.append(self._make_row_issue(
+                        row, "重复编号",
+                        f"编号【{serial_raw}】已在系统中存在"
+                    ))
+                else:
+                    seen_serials.add(serial_raw)
+
+            if any(i for i in issues_for_row if not isinstance(i, str)):
+                real_issues = [i for i in issues_for_row if not isinstance(i, str)]
+                summary.issues.extend(real_issues)
+            else:
+                if not issues_for_row:
+                    summary.importable += 1
+
+        return True, "", summary
+
+    def commit_accessory_import(self, filepath: str) -> Tuple[bool, str, int, int]:
+        self._require_permission("import_accessories")
+
+        ok, msg, rows, fmt = storage.parse_import_file(filepath)
+        if not ok:
+            self._append_import_log(filepath, fmt, 0, 0, 0, [msg])
+            return False, msg, 0, 0
+
+        pre_ok, pre_msg, summary = self.precheck_accessory_import_file(filepath)
+        if not pre_ok:
+            self._append_import_log(filepath, fmt, len(rows), 0, len(rows), [pre_msg])
+            return False, pre_msg, 0, len(rows)
+        has_issue = (
+            summary.field_missing > 0 or summary.device_not_found > 0
+            or summary.duplicate > 0 or summary.issues
+        )
+        if has_issue:
+            parts = []
+            if summary.field_missing:
+                parts.append(f"字段缺失 {summary.field_missing}")
+            if summary.device_not_found:
+                parts.append(f"未知设备 {summary.device_not_found}")
+            if summary.duplicate:
+                parts.append(f"重复编号 {summary.duplicate}")
+            other_issues = [i for i in summary.issues if i.get("kind") in ("数量非法", "日期格式错误")]
+            if other_issues:
+                parts.append(f"其他错误 {len(other_issues)}")
+            reason = (
+                "预检发现问题，整批未写入（必须全部合法才可导入）："
+                + "；".join(parts)
+            )
+            self._append_import_log(
+                filepath, fmt, len(rows), 0, len(rows), [reason]
+            )
+            return False, reason, 0, len(rows)
+
+        backup = copy.deepcopy(self.accessories)
+
+        success_count = 0
+        fail_count = 0
+        fail_reasons = []
+        seen_serials = set()
+
+        try:
+            for row in rows:
+                try:
+                    device_id = str(row.get("device_id", "")).strip()
+                    device = self.find_device(device_id)
+                    if not device:
+                        fail_count += 1
+                        fail_reasons.append(f"第{row.get('_row','?')}行: 设备不存在")
+                        continue
+
+                    name = str(row.get("name", "")).strip()
+                    if not name:
+                        fail_count += 1
+                        fail_reasons.append(f"第{row.get('_row','?')}行: 名称为空")
+                        continue
+
+                    qty_raw = str(row.get("quantity", "")).strip()
+                    qty = 1
+                    if qty_raw:
+                        qty = int(qty_raw)
+                    if qty <= 0:
+                        fail_count += 1
+                        fail_reasons.append(f"第{row.get('_row','?')}行: 数量非法")
+                        continue
+
+                    serial_no = str(row.get("serial_no", "")).strip()
+                    if serial_no:
+                        if serial_no in seen_serials:
+                            fail_count += 1
+                            fail_reasons.append(f"第{row.get('_row','?')}行: 编号重复")
+                            continue
+                        seen_serials.add(serial_no)
+
+                    expiry = str(row.get("expiry_date", "")).strip()
+                    if expiry:
+                        dt = self._parse_datetime(expiry)
+                        if not dt:
+                            fail_count += 1
+                            fail_reasons.append(f"第{row.get('_row','?')}行: 日期格式错误")
+                            continue
+
+                    acc_type = str(row.get("type", "")).strip()
+                    if acc_type not in AccessoryType.ALL_TYPES:
+                        acc_type = AccessoryType.ACCESSORY
+
+                    acc = DeviceAccessory(
+                        device_id=device.id,
+                        device_name=device.name,
+                        name=name,
+                        type=acc_type,
+                        quantity=qty,
+                        serial_no=serial_no,
+                        storage_location=str(row.get("storage_location", "")).strip(),
+                        expiry_date=expiry,
+                        responsible_person=str(row.get("responsible_person", "")).strip(),
+                        remark=str(row.get("remark", "")).strip(),
+                        created_by=self.current_user.username if self.current_user else "",
+                        created_by_role=self.current_user.role if self.current_user else "",
+                    )
+                    self.accessories.append(acc)
+                    success_count += 1
+                except Exception as e:
+                    fail_count += 1
+                    fail_reasons.append(f"第{row.get('_row','?')}行: {e}")
+
+            self.save_all()
+            self._append_import_log(filepath, fmt, len(rows), success_count, fail_count, fail_reasons)
+            return True, f"成功导入 {success_count} 条，失败 {fail_count} 条", success_count, fail_count
+
+        except Exception as e:
+            self.accessories = backup
+            try:
+                self.save_all()
+            except Exception:
+                pass
+            rollback_reason = f"导入过程发生异常，整批已回滚：{e}"
+            self._append_import_log(filepath, fmt, len(rows), 0, len(rows), [rollback_reason])
+            return False, rollback_reason, 0, 0
+
+    def export_accessories(self, accessory_ids: List[str],
+                           filepath: str,
+                           filter_info: Optional[dict] = None) -> Tuple[bool, str]:
+        self._require_permission("export_accessories")
+        ok, reason = self.check_export_dir_detail()
+        if not ok:
+            return False, f"导出失败：{reason}\n请先设置一个可写的导出目录。"
+        selected = [a for a in self.accessories if a.id in accessory_ids]
+        if not selected:
+            return False, "没有选中任何附件/证照记录"
+        operator = self.current_user.username if self.current_user else ""
+        devices_map = {d.id: d for d in self.devices}
+        if filepath.lower().endswith(".csv"):
+            ok = storage.export_accessories_csv(selected, filepath, filter_info, operator, devices_map)
+        else:
+            ok = storage.export_accessories_json(selected, filepath, filter_info, operator, devices_map)
+        if not ok:
+            return False, f"导出失败，目标文件无法写入：{filepath}"
+        return True, f"导出成功：{filepath}"
+
+    def get_accessory_check_hint(self, device_id: str) -> str:
+        accs = self.get_accessories_by_device(device_id)
+        if not accs:
+            return ""
+        parts = [f"{a.name} x{a.quantity}" for a in accs]
+        return "请核对附件/证照：" + "；".join(parts)
