@@ -81,6 +81,8 @@ class Device:
     model: str = ""
     serial_no: str = ""
     status: str = DeviceStatus.AVAILABLE
+    storage_location: str = ""
+    responsible_person: str = ""
     accessories: List[Accessory] = field(default_factory=list)
     remark: str = ""
     created_at: str = field(default_factory=_now_str)
@@ -335,6 +337,7 @@ class AppConfig:
     last_maintenance_filter: dict = field(default_factory=dict)
     maintenance_records_snapshot: dict = field(default_factory=dict)
     last_inventory_filter: dict = field(default_factory=dict)
+    last_active_inventory_session_id: str = ""
 
     def to_dict(self):
         return asdict(self)

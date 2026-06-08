@@ -6,6 +6,8 @@
     "model": "CB-X05",
     "serial_no": "EPSN-2024-001",
     "status": "可借出",
+    "storage_location": "",
+    "responsible_person": "",
     "accessories": [
       {
         "name": "电源适配器",
@@ -38,6 +40,8 @@
     "model": "ICD-PX470",
     "serial_no": "SNY-2024-101",
     "status": "可借出",
+    "storage_location": "",
+    "responsible_person": "",
     "accessories": [
       {
         "name": "USB充电线",
@@ -60,6 +64,8 @@
     "model": "MW550",
     "serial_no": "BENQ-2024-002",
     "status": "已借出",
+    "storage_location": "",
+    "responsible_person": "",
     "accessories": [
       {
         "name": "电源适配器",
@@ -87,6 +93,8 @@
     "model": "C920",
     "serial_no": "LOGT-2024-201",
     "status": "异常冻结",
+    "storage_location": "",
+    "responsible_person": "",
     "accessories": [
       {
         "name": "USB数据线",

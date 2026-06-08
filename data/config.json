@@ -1,4 +1,13 @@
 {
   "export_dir": "C:\\Users\\admin\\Documents\\设备管理导出",
-  "last_user": "admin"
+  "last_user": "admin",
+  "last_import_dir": "",
+  "last_import_format": "",
+  "last_import_summary": {},
+  "reminder_days": 3,
+  "default_maintenance_days": 7,
+  "last_maintenance_filter": {},
+  "maintenance_records_snapshot": {},
+  "last_inventory_filter": {},
+  "last_active_inventory_session_id": ""
 }

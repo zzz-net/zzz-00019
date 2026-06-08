@@ -179,7 +179,7 @@ def export_devices_csv(devices: List[Device], filepath: str) -> bool:
             writer = csv.writer(f)
             writer.writerow([
                 "设备ID", "名称", "类别", "型号", "序列号",
-                "状态", "配件", "备注", "创建时间"
+                "状态", "存放点", "负责人", "配件", "备注", "创建时间"
             ])
             for d in devices:
                 acc_str = "; ".join([
@@ -188,7 +188,8 @@ def export_devices_csv(devices: List[Device], filepath: str) -> bool:
                 ])
                 writer.writerow([
                     d.id, d.name, d.category, d.model, d.serial_no,
-                    d.status, acc_str, d.remark, d.created_at
+                    d.status, d.storage_location, d.responsible_person,
+                    acc_str, d.remark, d.created_at
                 ])
         return True
     except (IOError, OSError):
@@ -224,6 +225,8 @@ def seed_sample_data():
                 name="爱普生投影仪 CB-X05", category="投影仪",
                 model="CB-X05", serial_no="EPSN-2024-001",
                 status=DeviceStatus.AVAILABLE,
+                storage_location="会议室A设备柜",
+                responsible_person="张三",
                 accessories=[
                     Accessory(name="电源适配器", required=True, present=True),
                     Accessory(name="HDMI线", required=True, present=True),
@@ -236,6 +239,8 @@ def seed_sample_data():
                 name="索尼录音笔 ICD-PX470", category="录音笔",
                 model="ICD-PX470", serial_no="SNY-2024-101",
                 status=DeviceStatus.AVAILABLE,
+                storage_location="行政部抽屉B2",
+                responsible_person="李四",
                 accessories=[
                     Accessory(name="USB充电线", required=True, present=True),
                     Accessory(name="立体声麦克风", required=False, present=False),
@@ -246,6 +251,8 @@ def seed_sample_data():
                 name="明基投影仪 MW550", category="投影仪",
                 model="MW550", serial_no="BENQ-2024-002",
                 status=DeviceStatus.BORROWED,
+                storage_location="会议室B",
+                responsible_person="张三",
                 accessories=[
                     Accessory(name="电源适配器", required=True, present=True),
                     Accessory(name="HDMI线", required=True, present=True),
@@ -257,6 +264,8 @@ def seed_sample_data():
                 name="罗技摄像头 C920", category="摄像头",
                 model="C920", serial_no="LOGT-2024-201",
                 status=DeviceStatus.FROZEN,
+                storage_location="IT部维修区",
+                responsible_person="王五",
                 accessories=[
                     Accessory(name="USB数据线", required=True, present=True),
                     Accessory(name="镜头盖", required=False, present=False),

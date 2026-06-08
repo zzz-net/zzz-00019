@@ -6,7 +6,8 @@ from datetime import datetime, timedelta
 from models import (
     Device, Borrower, BorrowRecord, Accessory,
     DeviceStatus, RecordStatus, UserRole, User, _now_str,
-    MaintenanceRecord
+    MaintenanceRecord, InventorySession, InventoryItem,
+    InventoryStatus, InventoryItemResult
 )
 from business import EquipmentManager, BusinessError
 
@@ -37,6 +38,22 @@ FILTER_LABELS = {
     "due_soon": "临期",
     "overdue": "逾期",
     "returned": "已归还",
+}
+
+INVENTORY_STATUS_LABELS = {
+    "all": "全部",
+    InventoryStatus.DRAFT: "草稿",
+    InventoryStatus.IN_PROGRESS: "进行中",
+    InventoryStatus.COMPLETED: "已完成",
+}
+
+INVENTORY_RESULT_LABELS = {
+    InventoryItemResult.NORMAL: "正常",
+    InventoryItemResult.MISSING: "丢失",
+    InventoryItemResult.DAMAGED: "损坏",
+    InventoryItemResult.LOCATION_WRONG: "位置错误",
+    InventoryItemResult.ACCESSORY_MISSING: "配件缺失",
+    InventoryItemResult.OTHER: "其他异常",
 }
 
 
@@ -118,15 +135,27 @@ class DeviceDialog(tk.Toplevel):
         ttk.Entry(main, textvariable=self.serial_var, width=40).grid(
             row=3, column=1, pady=4, sticky="w")
 
-        ttk.Label(main, text="备注:").grid(row=4, column=0, sticky="ne", pady=4)
-        self.remark_text = tk.Text(main, width=38, height=4)
-        self.remark_text.grid(row=4, column=1, pady=4, sticky="w")
+        ttk.Label(main, text="存放点:").grid(row=4, column=0, sticky="e", pady=4)
+        self.location_var = tk.StringVar(
+            value=self.device.storage_location if self.device else "")
+        ttk.Entry(main, textvariable=self.location_var, width=40).grid(
+            row=4, column=1, pady=4, sticky="w")
+
+        ttk.Label(main, text="负责人:").grid(row=5, column=0, sticky="e", pady=4)
+        self.resp_var = tk.StringVar(
+            value=self.device.responsible_person if self.device else "")
+        ttk.Entry(main, textvariable=self.resp_var, width=40).grid(
+            row=5, column=1, pady=4, sticky="w")
+
+        ttk.Label(main, text="备注:").grid(row=6, column=0, sticky="ne", pady=4)
+        self.remark_text = tk.Text(main, width=38, height=3)
+        self.remark_text.grid(row=6, column=1, pady=4, sticky="w")
         if self.device and self.device.remark:
             self.remark_text.insert("1.0", self.device.remark)
 
-        ttk.Label(main, text="配件清单:").grid(row=5, column=0, sticky="nw", pady=4)
+        ttk.Label(main, text="配件清单:").grid(row=7, column=0, sticky="nw", pady=4)
         acc_frame = ttk.Frame(main)
-        acc_frame.grid(row=5, column=1, pady=4, sticky="w")
+        acc_frame.grid(row=7, column=1, pady=4, sticky="w")
         self.acc_list_frame = ttk.Frame(acc_frame)
         self.acc_list_frame.pack(fill="x")
         self._accessories = []
@@ -141,7 +170,7 @@ class DeviceDialog(tk.Toplevel):
         btn_add_acc.pack(anchor="w", pady=(4, 0))
 
         btns = ttk.Frame(main)
-        btns.grid(row=6, column=0, columnspan=2, pady=(12, 0))
+        btns.grid(row=8, column=0, columnspan=2, pady=(12, 0))
         ttk.Button(btns, text="确定", command=self._ok).pack(side="left", padx=6)
         ttk.Button(btns, text="取消", command=self.destroy).pack(side="left", padx=6)
 
@@ -192,6 +221,8 @@ class DeviceDialog(tk.Toplevel):
             "category": self.category_var.get().strip(),
             "model": self.model_var.get().strip(),
             "serial_no": self.serial_var.get().strip(),
+            "storage_location": self.location_var.get().strip(),
+            "responsible_person": self.resp_var.get().strip(),
             "accessories": list(self._accessories),
             "remark": self.remark_text.get("1.0", "end").strip(),
         }
@@ -664,6 +695,596 @@ class HistoryDialog(tk.Toplevel):
         ttk.Button(main, text="关闭", command=self.destroy).pack(pady=(8, 0))
 
 
+class CreateInventoryDialog(tk.Toplevel):
+    def __init__(self, master, manager: EquipmentManager):
+        super().__init__(master)
+        self.title("新建月度盘点")
+        self.geometry("640x560")
+        self.resizable(False, False)
+        self.manager = manager
+        self.result = None
+        self._selected_device_ids: List[str] = []
+        self._build()
+        self.grab_set()
+        self.transient(master)
+        self._refresh_preview()
+
+    def _build(self):
+        main = ttk.Frame(self, padding=12)
+        main.pack(fill="both", expand=True)
+
+        ttk.Label(main, text="盘点标题 *:").grid(row=0, column=0, sticky="e", pady=6)
+        self.title_var = tk.StringVar()
+        ttk.Entry(main, textvariable=self.title_var, width=50).grid(
+            row=0, column=1, pady=6, sticky="w")
+
+        filter_frame = ttk.LabelFrame(main, text="筛选条件（与手动选择二选一，优先手动选择）", padding=8)
+        filter_frame.grid(row=1, column=0, columnspan=2, sticky="we", pady=(8, 6))
+
+        ttk.Label(filter_frame, text="设备类别:").grid(row=0, column=0, sticky="e", pady=4)
+        self.category_var = tk.StringVar()
+        categories = self.manager.get_unique_categories()
+        ttk.Combobox(filter_frame, textvariable=self.category_var,
+                     values=[""] + categories, width=20, state="readonly"
+                     ).grid(row=0, column=1, pady=4, sticky="w")
+
+        ttk.Label(filter_frame, text="设备状态:").grid(row=0, column=2, sticky="e", pady=4, padx=(12, 0))
+        self.status_var = tk.StringVar(value="全部")
+        ttk.Combobox(filter_frame, textvariable=self.status_var, width=12, state="readonly",
+                     values=["全部", DeviceStatus.AVAILABLE, DeviceStatus.BORROWED,
+                             DeviceStatus.FROZEN, DeviceStatus.INSPECTING, DeviceStatus.MAINTENANCE]
+                     ).grid(row=0, column=3, pady=4, sticky="w")
+
+        ttk.Label(filter_frame, text="存放点:").grid(row=1, column=0, sticky="e", pady=4)
+        self.location_var = tk.StringVar()
+        locations = self.manager.get_unique_storage_locations()
+        ttk.Combobox(filter_frame, textvariable=self.location_var,
+                     values=[""] + locations, width=20, state="readonly"
+                     ).grid(row=1, column=1, pady=4, sticky="w")
+
+        ttk.Label(filter_frame, text="负责人:").grid(row=1, column=2, sticky="e", pady=4, padx=(12, 0))
+        self.resp_var = tk.StringVar()
+        resps = self.manager.get_unique_responsible_persons()
+        ttk.Combobox(filter_frame, textvariable=self.resp_var,
+                     values=[""] + resps, width=15, state="readonly"
+                     ).grid(row=1, column=3, pady=4, sticky="w")
+
+        ttk.Label(filter_frame, text="关键字:").grid(row=2, column=0, sticky="e", pady=4)
+        self.keyword_var = tk.StringVar()
+        ttk.Entry(filter_frame, textvariable=self.keyword_var, width=28).grid(
+            row=2, column=1, pady=4, sticky="w", columnspan=2)
+        ttk.Label(filter_frame, text="（名称/型号/序列号/ID）",
+                  foreground="#888").grid(row=2, column=3, sticky="w", padx=(4, 0))
+
+        ttk.Button(filter_frame, text="应用筛选", command=self._on_apply_filter
+                   ).grid(row=3, column=0, pady=(6, 0), sticky="w")
+        ttk.Button(filter_frame, text="重置筛选", command=self._on_reset_filter
+                   ).grid(row=3, column=1, pady=(6, 0), sticky="w", padx=4)
+        self.filter_count_label = ttk.Label(filter_frame, text="", foreground="#2980b9")
+        self.filter_count_label.grid(row=3, column=2, columnspan=2, pady=(6, 0), sticky="w")
+
+        manual_frame = ttk.LabelFrame(main, text="手动选择设备（勾选后将忽略上方筛选）", padding=8)
+        manual_frame.grid(row=2, column=0, columnspan=2, sticky="we", pady=(8, 6))
+
+        self.use_manual_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(manual_frame, text="使用手动选择", variable=self.use_manual_var,
+                        command=self._on_manual_toggle).grid(row=0, column=0, sticky="w")
+
+        tree_frame = ttk.Frame(manual_frame)
+        tree_frame.grid(row=1, column=0, columnspan=2, sticky="we", pady=(4, 0))
+        cols = ("id", "name", "category", "status")
+        self.device_select_tree = ttk.Treeview(
+            tree_frame, columns=cols, show="headings", height=6, selectmode="extended",
+        )
+        self.device_select_tree.heading("id", text="设备ID")
+        self.device_select_tree.heading("name", text="名称")
+        self.device_select_tree.heading("category", text="类别")
+        self.device_select_tree.heading("status", text="状态")
+        self.device_select_tree.column("id", width=90, anchor="center")
+        self.device_select_tree.column("name", width=240, anchor="w")
+        self.device_select_tree.column("category", width=80, anchor="center")
+        self.device_select_tree.column("status", width=80, anchor="center")
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.device_select_tree.yview)
+        self.device_select_tree.configure(yscrollcommand=vsb.set)
+        self.device_select_tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.device_select_tree.bind("<<TreeviewSelect>>", self._on_device_manual_select)
+        self.device_select_tree.configure(state="disabled")
+
+        for d in sorted(self.manager.devices, key=lambda x: x.name):
+            self.device_select_tree.insert("", "end", iid=d.id, values=(
+                d.id, d.name, d.category, d.status
+            ), tags=(d.status,))
+
+        self.manual_count_label = ttk.Label(manual_frame, text="", foreground="#2980b9")
+        self.manual_count_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        ttk.Label(main, text="备注:").grid(row=3, column=0, sticky="ne", pady=6)
+        self.remark_text = tk.Text(main, width=55, height=3)
+        self.remark_text.grid(row=3, column=1, pady=6, sticky="w")
+
+        self.preview_label = ttk.Label(main, text="", foreground="#2980b9")
+        self.preview_label.grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        btns = ttk.Frame(main)
+        btns.grid(row=5, column=0, columnspan=2, pady=(12, 0))
+        ttk.Button(btns, text="创建盘点", command=self._ok).pack(side="left", padx=6)
+        ttk.Button(btns, text="取消", command=self.destroy).pack(side="left", padx=6)
+
+    def _on_manual_toggle(self):
+        if self.use_manual_var.get():
+            self.device_select_tree.configure(state="normal")
+        else:
+            self.device_select_tree.configure(state="disabled")
+            self._selected_device_ids = []
+        self._refresh_preview()
+
+    def _on_device_manual_select(self, _event=None):
+        self._selected_device_ids = list(self.device_select_tree.selection())
+        self.manual_count_label.config(text=f"已手动选择 {len(self._selected_device_ids)} 台设备")
+        self._refresh_preview()
+
+    def _on_apply_filter(self):
+        self._refresh_preview()
+
+    def _on_reset_filter(self):
+        self.category_var.set("")
+        self.status_var.set("全部")
+        self.location_var.set("")
+        self.resp_var.set("")
+        self.keyword_var.set("")
+        self._refresh_preview()
+
+    def _count_filtered_devices(self) -> int:
+        category = self.category_var.get().strip()
+        status_filter = self.status_var.get().strip()
+        status_val = "" if status_filter == "全部" else status_filter
+        keyword = self.keyword_var.get().strip()
+        storage_location = self.location_var.get().strip()
+        responsible_person = self.resp_var.get().strip()
+        filtered = self.manager._filter_devices_for_inventory(
+            category, status_val, keyword, storage_location, responsible_person
+        )
+        return len(filtered)
+
+    def _refresh_preview(self):
+        if self.use_manual_var.get():
+            n = len(self._selected_device_ids)
+            self.filter_count_label.config(text="")
+            self.preview_label.config(
+                text=f"将创建包含 {n} 台设备的盘点（手动选择）" if n > 0
+                else "请勾选要盘点的设备"
+            )
+        else:
+            n = self._count_filtered_devices()
+            self.filter_count_label.config(text=f"当前筛选匹配 {n} 台设备")
+            self.preview_label.config(
+                text=f"将创建包含 {n} 台设备的盘点（按筛选条件）" if n > 0
+                else "当前筛选条件下没有匹配的设备"
+            )
+
+    def _ok(self):
+        title = self.title_var.get().strip()
+        if not title:
+            messagebox.showerror("错误", "请填写盘点标题", parent=self)
+            return
+
+        if self.use_manual_var.get():
+            if not self._selected_device_ids:
+                messagebox.showerror("错误", "请至少勾选一台设备", parent=self)
+                return
+            device_ids = self._selected_device_ids
+        else:
+            n = self._count_filtered_devices()
+            if n == 0:
+                messagebox.showerror("错误", "当前筛选条件下没有匹配的设备", parent=self)
+                return
+            device_ids = None
+
+        try:
+            session = self.manager.create_inventory(
+                title=title,
+                category=self.category_var.get().strip(),
+                status_filter="" if self.status_var.get().strip() == "全部" else self.status_var.get().strip(),
+                keyword=self.keyword_var.get().strip(),
+                storage_location=self.location_var.get().strip(),
+                responsible_person=self.resp_var.get().strip(),
+                device_ids=device_ids,
+                remark=self.remark_text.get("1.0", "end").strip(),
+            )
+            self.result = session
+            messagebox.showinfo("成功", f"盘点已创建：{session.title}\n共 {len(session.items)} 台设备", parent=self)
+            self.destroy()
+        except BusinessError as e:
+            messagebox.showerror("创建失败", str(e), parent=self)
+
+
+class FillInventoryItemDialog(tk.Toplevel):
+    def __init__(self, master, manager: EquipmentManager,
+                 session: InventorySession, item: InventoryItem):
+        super().__init__(master)
+        self.title(f"盘点填写 - {item.device_name}")
+        self.geometry("560x520")
+        self.resizable(False, False)
+        self.manager = manager
+        self.session = session
+        self.item = item
+        self.result = None
+        self._device = manager.find_device(item.device_id)
+        self._build()
+        self.grab_set()
+        self.transient(master)
+
+    def _build(self):
+        main = ttk.Frame(self, padding=12)
+        main.pack(fill="both", expand=True)
+
+        user_role = self.manager.current_user.role if self.manager.current_user else ""
+        is_inspector = user_role == UserRole.INSPECTOR
+
+        info_frame = ttk.LabelFrame(main, text="设备信息", padding=8)
+        info_frame.pack(fill="x", pady=(0, 8))
+        ttk.Label(info_frame, text=f"设备ID: {self.item.device_id}").grid(row=0, column=0, sticky="w")
+        ttk.Label(info_frame, text=f"名称: {self.item.device_name}").grid(row=0, column=1, sticky="w", padx=20)
+        ttk.Label(info_frame, text=f"系统原状态: {self.item.original_status}",
+                  foreground=STATUS_COLORS.get(self.item.original_status, "#000")).grid(
+            row=1, column=0, sticky="w", pady=2)
+        if self._device:
+            ttk.Label(info_frame, text=f"类别: {self._device.category}").grid(row=1, column=1, sticky="w", padx=20, pady=2)
+        if is_inspector:
+            ttk.Label(info_frame, text="【验收账号】仅可填写实物情况、位置和备注",
+                      foreground="#2980b9").grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
+
+        has_conflict, conflict_msg = self.manager._has_device_active_business(self.item.device_id)
+        if has_conflict:
+            tip = ttk.Label(main, text=f"⚠ 状态冲突：{conflict_msg}\n盘点中不能覆盖正在进行的业务状态，请保持实际状态与系统原状态一致。",
+                            foreground="#c0392b", wraplength=520, justify="left")
+            tip.pack(fill="x", pady=(0, 8))
+
+        ttk.Label(main, text="实际状态:").pack(anchor="w")
+        self.actual_status_var = tk.StringVar(value=self.item.actual_status or self.item.original_status)
+        status_combo = ttk.Combobox(main, textvariable=self.actual_status_var,
+                                    state="readonly", width=30,
+                                    values=[DeviceStatus.AVAILABLE, DeviceStatus.BORROWED,
+                                            DeviceStatus.FROZEN, DeviceStatus.INSPECTING,
+                                            DeviceStatus.MAINTENANCE])
+        status_combo.pack(fill="x", pady=(2, 8))
+        if has_conflict:
+            status_combo.configure(state="disabled")
+
+        ttk.Label(main, text="实际存放位置:").pack(anchor="w")
+        self.location_var = tk.StringVar(value=self.item.actual_location or "")
+        ttk.Entry(main, textvariable=self.location_var, width=55).pack(fill="x", pady=(2, 8))
+
+        if self._device and self._device.accessories:
+            if is_inspector:
+                acc_label = ttk.Label(main, text="缺失配件（验收账号不可修改）:")
+            else:
+                acc_label = ttk.Label(main, text="缺失配件（勾选缺失的）:")
+            acc_label.pack(anchor="w")
+            acc_frame = ttk.LabelFrame(main, text="配件核对", padding=6)
+            acc_frame.pack(fill="x", pady=(2, 8))
+            self._acc_vars = {}
+            for i, acc in enumerate(self._device.accessories):
+                var = tk.BooleanVar(
+                    value=acc.name in (self.item.missing_accessories or [])
+                )
+                self._acc_vars[acc.name] = var
+                label_text = f"{acc.name}"
+                if acc.required:
+                    label_text += " 【必备】"
+                cb = ttk.Checkbutton(acc_frame, text=label_text, variable=var)
+                cb.grid(row=i, column=0, sticky="w", pady=1)
+                if is_inspector:
+                    cb.configure(state="disabled")
+        else:
+            self._acc_vars = {}
+
+        if is_inspector:
+            result_label = ttk.Label(main, text="盘点结果（验收账号不可修改，由系统根据填写内容自动判定）:")
+        else:
+            result_label = ttk.Label(main, text="盘点结果:")
+        result_label.pack(anchor="w")
+        self.result_var = tk.StringVar(
+            value=self.item.inventory_result or InventoryItemResult.NORMAL
+        )
+        result_combo = ttk.Combobox(main, textvariable=self.result_var,
+                                    state="readonly", width=30,
+                                    values=InventoryItemResult.ALL_RESULTS)
+        result_combo.pack(fill="x", pady=(2, 8))
+        if is_inspector:
+            result_combo.configure(state="disabled")
+
+        ttk.Label(main, text="备注:").pack(anchor="w")
+        self.remark_text = tk.Text(main, width=55, height=3)
+        self.remark_text.pack(fill="x", pady=(2, 8))
+        if self.item.remark:
+            self.remark_text.insert("1.0", self.item.remark)
+
+        btns = ttk.Frame(main)
+        btns.pack(pady=(8, 0))
+        ttk.Button(btns, text="保存", command=self._ok).pack(side="left", padx=6)
+        ttk.Button(btns, text="取消", command=self.destroy).pack(side="left", padx=6)
+
+    def _ok(self):
+        user_role = self.manager.current_user.role if self.manager.current_user else ""
+        is_inspector = user_role == UserRole.INSPECTOR
+
+        if is_inspector:
+            missing = list(self.item.missing_accessories or [])
+            actual_status = self.actual_status_var.get().strip()
+            actual_location = self.location_var.get().strip()
+
+            has_conflict, _ = self.manager._has_device_active_business(self.item.device_id)
+            orig_status = self.item.original_status
+            orig_location = self._device.storage_location if self._device else ""
+            orig_missing = list(self.item.missing_accessories or [])
+
+            result_type = InventoryItemResult.NORMAL
+            if not has_conflict and actual_status != orig_status:
+                if actual_status in (DeviceStatus.FROZEN, DeviceStatus.MAINTENANCE):
+                    result_type = InventoryItemResult.DAMAGED
+                elif actual_status == DeviceStatus.BORROWED:
+                    result_type = InventoryItemResult.LOST
+            if orig_location and actual_location and actual_location != orig_location:
+                result_type = InventoryItemResult.WRONG_LOCATION
+            if missing and len(missing) > len(orig_missing):
+                result_type = InventoryItemResult.MISSING_ACCESSORY
+        else:
+            missing = [name for name, var in self._acc_vars.items() if var.get()]
+            result_type = self.result_var.get().strip()
+
+        try:
+            item = self.manager.fill_inventory_item(
+                session_id=self.session.id,
+                device_id=self.item.device_id,
+                actual_status=self.actual_status_var.get().strip(),
+                actual_location=self.location_var.get().strip(),
+                missing_accessories=missing,
+                inventory_result=result_type,
+                remark=self.remark_text.get("1.0", "end").strip(),
+            )
+            self.result = item
+            messagebox.showinfo("成功", f"已保存盘点结果：{item.inventory_result}", parent=self)
+            self.destroy()
+        except BusinessError as e:
+            messagebox.showerror("保存失败", str(e), parent=self)
+
+
+class InventoryDetailDialog(tk.Toplevel):
+    def __init__(self, master, manager: EquipmentManager, session: InventorySession):
+        super().__init__(master)
+        self.title(f"盘点详情 - {session.title}")
+        self.geometry("960x680")
+        self.minsize(800, 560)
+        self.manager = manager
+        self.session = session
+        self._build()
+        self.grab_set()
+        self.transient(master)
+
+    def _build(self):
+        main = ttk.Frame(self, padding=12)
+        main.pack(fill="both", expand=True)
+
+        info_frame = ttk.LabelFrame(main, text="盘点概要", padding=8)
+        info_frame.pack(fill="x", pady=(0, 8))
+        s = self.session
+        ttk.Label(info_frame, text=f"标题: {s.title}").grid(row=0, column=0, sticky="w")
+        status_color = "#27ae60" if s.status == InventoryStatus.COMPLETED else (
+            "#e67e22" if s.status == InventoryStatus.IN_PROGRESS else "#888")
+        ttk.Label(info_frame, text=f"状态: {s.status}", foreground=status_color).grid(
+            row=0, column=1, sticky="w", padx=20)
+        ttk.Label(info_frame, text=f"盘点ID: {s.id}").grid(row=0, column=2, sticky="w", padx=20)
+
+        progress = self.manager.get_inventory_progress(s)
+        ttk.Label(info_frame, text=f"创建人: {s.created_by} ({s.created_by_role})").grid(
+            row=1, column=0, sticky="w", pady=2)
+        ttk.Label(info_frame, text=f"创建时间: {s.created_at}").grid(
+            row=1, column=1, sticky="w", padx=20, pady=2)
+        if s.completed_at:
+            ttk.Label(info_frame, text=f"完成时间: {s.completed_at}").grid(
+                row=1, column=2, sticky="w", padx=20, pady=2)
+            ttk.Label(info_frame, text=f"完成人: {s.completed_by} ({s.completed_by_role})").grid(
+                row=2, column=0, sticky="w", pady=2)
+
+        progress_text = (f"进度: {progress['filled']}/{progress['total']} "
+                         f"({progress['percent']}%)  正常: {progress['normal']}  "
+                         f"异常: {progress['exception']}  剩余: {progress['remaining']}")
+        ex_count = progress["exception"]
+        ttk.Label(info_frame, text=progress_text,
+                  foreground="#c0392b" if ex_count > 0 else "#27ae60").grid(
+            row=2, column=1, columnspan=2, sticky="w", padx=20, pady=2)
+
+        if s.filter_conditions:
+            fc = s.filter_conditions
+            parts = []
+            if fc.get("category"):
+                parts.append(f"类别={fc['category']}")
+            if fc.get("status_filter"):
+                parts.append(f"状态={fc['status_filter']}")
+            if fc.get("storage_location"):
+                parts.append(f"存放点={fc['storage_location']}")
+            if fc.get("responsible_person"):
+                parts.append(f"负责人={fc['responsible_person']}")
+            if fc.get("keyword"):
+                parts.append(f"关键字={fc['keyword']}")
+            fc_str = "  ".join(parts) if parts else str(fc)
+            ttk.Label(info_frame, text=f"筛选条件: {fc_str}").grid(
+                row=3, column=0, columnspan=3, sticky="w", pady=2)
+        if s.remark:
+            ttk.Label(info_frame, text=f"备注: {s.remark[:100]}").grid(
+                row=4, column=0, columnspan=3, sticky="w", pady=2)
+
+        nb = ttk.Notebook(main)
+        nb.pack(fill="both", expand=True, pady=(4, 0))
+
+        summary_tab = ttk.Frame(nb)
+        diff_tab = ttk.Frame(nb)
+        items_tab = ttk.Frame(nb)
+        nb.add(summary_tab, text="异常汇总")
+        nb.add(diff_tab, text="差异明细")
+        nb.add(items_tab, text="全部明细")
+
+        self._build_summary_tab(summary_tab)
+        self._build_diff_tab(diff_tab)
+        self._build_items_tab(items_tab)
+
+        btns = ttk.Frame(main)
+        btns.pack(pady=(10, 0))
+        if self.manager.has_permission("export_inventory") and s.status == InventoryStatus.COMPLETED:
+            self.btn_export_csv = ttk.Button(btns, text="导出 CSV",
+                                             command=lambda: self._do_export("csv"))
+            self.btn_export_csv.pack(side="left", padx=4)
+            self.btn_export_json = ttk.Button(btns, text="导出 JSON",
+                                              command=lambda: self._do_export("json"))
+            self.btn_export_json.pack(side="left", padx=4)
+        ttk.Button(btns, text="关闭", command=self.destroy).pack(side="left", padx=6)
+
+    def _build_summary_tab(self, parent):
+        summary = self.manager.get_inventory_exception_summary(self.session)
+
+        top_frame = ttk.Frame(parent, padding=8)
+        top_frame.pack(fill="x")
+        total_items = len(self.session.items)
+        filled = sum(1 for it in self.session.items if it.inventory_result)
+        ttk.Label(top_frame,
+                  text=f"总计: {total_items} 台  已盘点: {filled} 台  "
+                       f"异常: {summary.get('__total__', 0)} 台",
+                  font=("", 10, "bold")).pack(side="left")
+
+        tree_frame = ttk.Frame(parent, padding=8)
+        tree_frame.pack(fill="both", expand=True)
+        cols = ("result_type", "count", "devices")
+        tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
+        tree.heading("result_type", text="异常类型")
+        tree.heading("count", text="数量")
+        tree.heading("devices", text="涉及设备")
+        tree.column("result_type", width=120, anchor="center")
+        tree.column("count", width=60, anchor="center")
+        tree.column("devices", width=600, anchor="w")
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        display_order = [
+            InventoryItemResult.LOST,
+            InventoryItemResult.DAMAGED,
+            InventoryItemResult.WRONG_LOCATION,
+            InventoryItemResult.MISSING_ACCESSORY,
+            InventoryItemResult.OTHER,
+        ]
+        for rtype in display_order:
+            info = summary.get(rtype)
+            if info and info["count"] > 0:
+                tree.insert("", "end", values=(
+                    rtype, info["count"],
+                    "; ".join(f"{d['device_name']}({d['device_id']})" for d in info["devices"])
+                ))
+
+        if not any(summary.get(r, {}).get("count", 0) > 0 for r in display_order):
+            tree.insert("", "end", values=("无异常", 0, "所有设备盘点正常"))
+
+    def _build_diff_tab(self, parent):
+        diffs = self.manager.get_inventory_diff_details(self.session)
+
+        tree_frame = ttk.Frame(parent, padding=8)
+        tree_frame.pack(fill="both", expand=True)
+        cols = ("device_id", "device_name", "field", "original", "actual", "remark")
+        tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
+        tree.heading("device_id", text="设备ID")
+        tree.heading("device_name", text="设备名称")
+        tree.heading("field", text="差异项")
+        tree.heading("original", text="原值")
+        tree.heading("actual", text="实际值")
+        tree.heading("remark", text="备注")
+        tree.column("device_id", width=80, anchor="center")
+        tree.column("device_name", width=150, anchor="w")
+        tree.column("field", width=100, anchor="center")
+        tree.column("original", width=140, anchor="w")
+        tree.column("actual", width=140, anchor="w")
+        tree.column("remark", width=250, anchor="w")
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        tree.tag_configure("diff", background="#fdecea", foreground="#c0392b")
+
+        if not diffs:
+            tree.insert("", "end", values=("-", "无差异", "-", "-", "-",
+                                            "所有设备状态、位置、配件均与系统一致"))
+        for d in diffs:
+            tree.insert("", "end", values=(
+                d["device_id"], d["device_name"],
+                d["field"], d["original"], d["actual"],
+                d.get("remark", "")
+            ), tags=("diff",))
+
+    def _build_items_tab(self, parent):
+        tree_frame = ttk.Frame(parent, padding=8)
+        tree_frame.pack(fill="both", expand=True)
+        cols = ("device_id", "device_name", "original_status", "actual_status",
+                "location", "missing_acc", "result", "filled_by", "filled_at")
+        tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="browse")
+        tree.heading("device_id", text="设备ID")
+        tree.heading("device_name", text="设备名称")
+        tree.heading("original_status", text="系统原状态")
+        tree.heading("actual_status", text="实际状态")
+        tree.heading("location", text="实际位置")
+        tree.heading("missing_acc", text="缺失配件")
+        tree.heading("result", text="盘点结果")
+        tree.heading("filled_by", text="填写人")
+        tree.heading("filled_at", text="填写时间")
+        tree.column("device_id", width=70, anchor="center")
+        tree.column("device_name", width=140, anchor="w")
+        tree.column("original_status", width=80, anchor="center")
+        tree.column("actual_status", width=80, anchor="center")
+        tree.column("location", width=90, anchor="w")
+        tree.column("missing_acc", width=120, anchor="w")
+        tree.column("result", width=80, anchor="center")
+        tree.column("filled_by", width=70, anchor="w")
+        tree.column("filled_at", width=130, anchor="w")
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        for it in self.session.items:
+            tree.insert("", "end", values=(
+                it.device_id, it.device_name, it.original_status,
+                it.actual_status or "-", it.actual_location or "-",
+                "; ".join(it.missing_accessories) if it.missing_accessories else "-",
+                it.inventory_result or "未填写",
+                it.filled_by or "-", it.filled_at or "-"
+            ), tags=("exception" if it.inventory_result != InventoryItemResult.NORMAL and it.inventory_result else "normal",))
+
+        tree.tag_configure("exception", foreground="#c0392b", background="#fdecea")
+
+    def _do_export(self, fmt: str):
+        if not self.manager.check_export_dir_detail()[0]:
+            messagebox.showerror("导出失败", "请先在主界面设置导出目录。", parent=self)
+            return
+        default_name = f"盘点_{self.session.title}_{_now_str().replace(':', '-').replace(' ', '_')}"
+        ext = f".{fmt}"
+        filepath = filedialog.asksaveasfilename(
+            title=f"导出盘点结果为 {fmt.upper()}",
+            initialdir=self.manager.config.export_dir,
+            initialfile=default_name + ext,
+            defaultextension=ext,
+            filetypes=[(f"{fmt.upper()} 文件", ext)]
+        )
+        if not filepath:
+            return
+        ok, msg = self.manager.export_inventory_session(self.session.id, filepath)
+        if ok:
+            ex_count = self.manager.get_inventory_exception_count(self.session)
+            messagebox.showinfo("成功", f"{msg}\n\n共 {len(self.session.items)} 台设备，异常 {ex_count} 台",
+                                parent=self)
+        else:
+            messagebox.showerror("失败", msg, parent=self)
+
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -677,6 +1298,9 @@ class App:
         self._maint_filter_status: str = "all"
         self._maint_filter_start_from: str = ""
         self._maint_filter_start_to: str = ""
+        self._selected_inventory_id: Optional[str] = None
+        self._selected_inventory_item_device_id: Optional[str] = None
+        self._inventory_filter_status: str = "all"
         self._build_ui()
         self._refresh_all()
 
@@ -723,7 +1347,18 @@ class App:
         main_paned.add(right_frame, weight=2)
 
         self._build_devices_panel(left_frame)
-        self._build_records_panel(right_frame)
+
+        self.right_notebook = ttk.Notebook(right_frame)
+        self.right_notebook.pack(fill="both", expand=True)
+
+        records_tab = ttk.Frame(self.right_notebook)
+        inventory_tab = ttk.Frame(self.right_notebook)
+        self.right_notebook.add(records_tab, text="借用记录")
+        self.right_notebook.add(inventory_tab, text="盘点工作台")
+
+        self._build_records_panel(records_tab)
+        self._build_inventory_panel(inventory_tab)
+        self._build_maintenance_panel(left_frame)
 
         self.status_var = tk.StringVar(value="就绪")
         status_bar = ttk.Label(self.root, textvariable=self.status_var,
@@ -755,18 +1390,22 @@ class App:
 
         tree_frame = ttk.Frame(frame)
         tree_frame.pack(fill="both", expand=True)
-        cols = ("name", "category", "status", "model", "serial")
+        cols = ("name", "category", "status", "location", "resp", "model", "serial")
         self.device_tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
         self.device_tree.heading("name", text="名称")
         self.device_tree.heading("category", text="类别")
         self.device_tree.heading("status", text="状态")
+        self.device_tree.heading("location", text="存放点")
+        self.device_tree.heading("resp", text="负责人")
         self.device_tree.heading("model", text="型号")
         self.device_tree.heading("serial", text="序列号")
-        self.device_tree.column("name", width=180, anchor="w")
-        self.device_tree.column("category", width=80, anchor="center")
-        self.device_tree.column("status", width=80, anchor="center")
-        self.device_tree.column("model", width=110, anchor="w")
-        self.device_tree.column("serial", width=120, anchor="w")
+        self.device_tree.column("name", width=170, anchor="w")
+        self.device_tree.column("category", width=60, anchor="center")
+        self.device_tree.column("status", width=70, anchor="center")
+        self.device_tree.column("location", width=110, anchor="w")
+        self.device_tree.column("resp", width=60, anchor="center")
+        self.device_tree.column("model", width=100, anchor="w")
+        self.device_tree.column("serial", width=110, anchor="w")
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.device_tree.yview)
         self.device_tree.configure(yscrollcommand=vsb.set)
         self.device_tree.pack(side="left", fill="both", expand=True)
@@ -807,8 +1446,6 @@ class App:
         self.borrower_tree.column("department", width=140, anchor="w")
         self.borrower_tree.column("phone", width=140, anchor="w")
         self.borrower_tree.pack(fill="x")
-
-        self._build_maintenance_panel(parent)
 
     def _build_maintenance_panel(self, parent):
         maint_frame = ttk.LabelFrame(parent, text="维修/保养记录", padding=6)
@@ -882,6 +1519,113 @@ class App:
 
         self.maint_tree.tag_configure("in_progress", foreground=STATUS_COLORS[DeviceStatus.MAINTENANCE])
         self.maint_tree.tag_configure("cancelled", foreground="#7f8c8d")
+
+    def _build_inventory_panel(self, parent):
+        inv_frame = ttk.LabelFrame(parent, text="月度盘点", padding=6)
+        inv_frame.pack(fill="both", expand=True, pady=(8, 0))
+
+        filter_row = ttk.Frame(inv_frame)
+        filter_row.pack(fill="x", pady=(0, 4))
+
+        ttk.Label(filter_row, text="盘点状态:").pack(side="left", padx=(0, 2))
+        self.inv_status_var = tk.StringVar(value=INVENTORY_STATUS_LABELS["all"])
+        inv_status_combo = ttk.Combobox(
+            filter_row, textvariable=self.inv_status_var, width=10, state="readonly",
+            values=list(INVENTORY_STATUS_LABELS.values())
+        )
+        inv_status_combo.pack(side="left", padx=(0, 6))
+
+        self.btn_inv_apply = ttk.Button(filter_row, text="应用筛选",
+                                        command=self._on_inv_filter_apply)
+        self.btn_inv_apply.pack(side="left", padx=2)
+        self.btn_inv_reset = ttk.Button(filter_row, text="重置",
+                                        command=self._on_inv_filter_reset)
+        self.btn_inv_reset.pack(side="left", padx=2)
+
+        self.btn_inv_continue = ttk.Button(filter_row, text="继续上次盘点",
+                                           command=self._continue_last_inventory)
+        self.btn_inv_continue.pack(side="left", padx=2)
+
+        self.btn_inv_create = ttk.Button(filter_row, text="新建盘点",
+                                         command=self._create_inventory)
+        self.btn_inv_create.pack(side="right", padx=2)
+        self.btn_inv_export = ttk.Button(filter_row, text="导出选中",
+                                         command=self._export_inventory)
+        self.btn_inv_export.pack(side="right", padx=2)
+        self.btn_inv_complete = ttk.Button(filter_row, text="完成盘点",
+                                           command=self._complete_inventory)
+        self.btn_inv_complete.pack(side="right", padx=2)
+        self.btn_inv_detail = ttk.Button(filter_row, text="查看详情",
+                                         command=self._view_inventory_detail)
+        self.btn_inv_detail.pack(side="right", padx=2)
+        self.btn_inv_fill = ttk.Button(filter_row, text="填写",
+                                       command=self._fill_inventory_item)
+        self.btn_inv_fill.pack(side="right", padx=2)
+
+        self.inv_status_label = ttk.Label(filter_row, text="", foreground="#2980b9")
+        self.inv_status_label.pack(side="right", padx=6)
+
+        itree_frame = ttk.Frame(inv_frame)
+        itree_frame.pack(fill="both", expand=True)
+        icols = ("id", "title", "status", "items", "exceptions",
+                 "created_by", "created_at", "completed_at")
+        self.inv_tree = ttk.Treeview(itree_frame, columns=icols,
+                                     show="headings", height=7, selectmode="browse")
+        self.inv_tree.heading("id", text="盘点ID")
+        self.inv_tree.heading("title", text="标题")
+        self.inv_tree.heading("status", text="状态")
+        self.inv_tree.heading("items", text="设备数")
+        self.inv_tree.heading("exceptions", text="异常数")
+        self.inv_tree.heading("created_by", text="创建人")
+        self.inv_tree.heading("created_at", text="创建时间")
+        self.inv_tree.heading("completed_at", text="完成时间")
+        self.inv_tree.column("id", width=80, anchor="center")
+        self.inv_tree.column("title", width=180, anchor="w")
+        self.inv_tree.column("status", width=70, anchor="center")
+        self.inv_tree.column("items", width=60, anchor="center")
+        self.inv_tree.column("exceptions", width=60, anchor="center")
+        self.inv_tree.column("created_by", width=80, anchor="w")
+        self.inv_tree.column("created_at", width=140, anchor="w")
+        self.inv_tree.column("completed_at", width=140, anchor="w")
+        ivsb = ttk.Scrollbar(itree_frame, orient="vertical", command=self.inv_tree.yview)
+        self.inv_tree.configure(yscrollcommand=ivsb.set)
+        self.inv_tree.pack(side="left", fill="both", expand=True)
+        ivsb.pack(side="right", fill="y")
+        self.inv_tree.bind("<<TreeviewSelect>>", self._on_inventory_selected)
+
+        self.inv_tree.tag_configure(InventoryStatus.DRAFT, foreground="#888")
+        self.inv_tree.tag_configure(InventoryStatus.IN_PROGRESS, foreground="#e67e22")
+        self.inv_tree.tag_configure(InventoryStatus.COMPLETED, foreground="#27ae60")
+
+        iitem_frame = ttk.LabelFrame(inv_frame, text="盘点明细（选中盘点后显示）", padding=4)
+        iitem_frame.pack(fill="both", expand=True, pady=(6, 0))
+
+        iitree_frame = ttk.Frame(iitem_frame)
+        iitree_frame.pack(fill="both", expand=True)
+        iicols = ("device_id", "device_name", "original_status", "actual_status",
+                  "result", "filled_by")
+        self.inv_item_tree = ttk.Treeview(iitree_frame, columns=iicols,
+                                          show="headings", height=5, selectmode="browse")
+        self.inv_item_tree.heading("device_id", text="设备ID")
+        self.inv_item_tree.heading("device_name", text="设备名称")
+        self.inv_item_tree.heading("original_status", text="系统原状态")
+        self.inv_item_tree.heading("actual_status", text="实际状态")
+        self.inv_item_tree.heading("result", text="盘点结果")
+        self.inv_item_tree.heading("filled_by", text="填写人")
+        self.inv_item_tree.column("device_id", width=80, anchor="center")
+        self.inv_item_tree.column("device_name", width=180, anchor="w")
+        self.inv_item_tree.column("original_status", width=90, anchor="center")
+        self.inv_item_tree.column("actual_status", width=90, anchor="center")
+        self.inv_item_tree.column("result", width=90, anchor="center")
+        self.inv_item_tree.column("filled_by", width=80, anchor="w")
+        iivsb = ttk.Scrollbar(iitree_frame, orient="vertical", command=self.inv_item_tree.yview)
+        self.inv_item_tree.configure(yscrollcommand=iivsb.set)
+        self.inv_item_tree.pack(side="left", fill="both", expand=True)
+        iivsb.pack(side="right", fill="y")
+        self.inv_item_tree.bind("<<TreeviewSelect>>", self._on_inventory_item_selected)
+
+        self.inv_item_tree.tag_configure("exception", foreground="#c0392b", background="#fdecea")
+        self.inv_item_tree.tag_configure("unfilled", foreground="#888")
 
     def _build_records_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="借用记录", padding=6)
@@ -975,8 +1719,10 @@ class App:
         self._refresh_devices()
         self._refresh_borrowers()
         self._restore_last_maintenance_filter()
+        self._restore_last_inventory_filter()
         self._refresh_records()
         self._refresh_maintenance_logs()
+        self._refresh_inventory_sessions()
         self._refresh_export_dir()
         self._apply_permissions()
 
@@ -992,6 +1738,19 @@ class App:
         self.maint_status_var.set(status_label)
         self.maint_from_var.set(self._maint_filter_start_from)
         self.maint_to_var.set(self._maint_filter_start_to)
+
+    def _restore_last_inventory_filter(self):
+        saved = self.manager.get_last_inventory_filter()
+        if saved:
+            self._inventory_filter_status = saved.get("status_filter", "all")
+        status_label = INVENTORY_STATUS_LABELS.get(self._inventory_filter_status, INVENTORY_STATUS_LABELS["all"])
+        self.inv_status_var.set(status_label)
+        if self.manager.has_permission("fill_inventory"):
+            session = self.manager.get_active_inventory_session()
+            if session:
+                self._selected_inventory_id = session.id
+                self._inventory_filter_status = "all"
+                self.inv_status_var.set(INVENTORY_STATUS_LABELS["all"])
 
     def _refresh_user_combo(self):
         values = [f"{u.username} ({u.display_name} - {u.role})" for u in self.manager.users]
@@ -1010,7 +1769,9 @@ class App:
         self.device_tree.delete(*self.device_tree.get_children())
         for d in self.manager.devices:
             self.device_tree.insert("", "end", iid=d.id, values=(
-                d.name, d.category, d.status, d.model, d.serial_no
+                d.name, d.category, d.status,
+                d.storage_location or "-", d.responsible_person or "-",
+                d.model, d.serial_no
             ), tags=(d.status,))
         self._refresh_device_detail()
 
@@ -1098,6 +1859,7 @@ class App:
         if device:
             lines = [f"设备: {device.name}  ({device.category} / {device.status})",
                      f"型号: {device.model or '-'}    序列号: {device.serial_no or '-'}",
+                     f"存放点: {device.storage_location or '-'}    负责人: {device.responsible_person or '-'}",
                      f"创建时间: {device.created_at}"]
             if device.accessories:
                 acc_strs = []
@@ -1146,6 +1908,11 @@ class App:
             "cancel_maintenance": [self.btn_cancel_maintenance],
             "view_maintenance": [self.btn_maint_apply, self.btn_maint_reset],
             "export_maintenance": [self.btn_maint_export],
+            "create_inventory": [self.btn_inv_create],
+            "complete_inventory": [self.btn_inv_complete],
+            "fill_inventory": [self.btn_inv_fill, self.btn_inv_continue],
+            "view_inventory": [self.btn_inv_apply, self.btn_inv_reset, self.btn_inv_detail],
+            "export_inventory": [self.btn_inv_export],
         }
         for perm, widgets in perm_map.items():
             enabled = self.manager.has_permission(perm)
@@ -1162,6 +1929,12 @@ class App:
             self.maint_to_var.set("")
             for child in self.maint_tree.winfo_children():
                 child.pack_forget() if hasattr(child, "pack_forget") else None
+
+        if not self.manager.has_permission("view_inventory"):
+            self.inv_status_var.set(INVENTORY_STATUS_LABELS["all"])
+            self.inv_tree.delete(*self.inv_tree.get_children())
+            self.inv_item_tree.delete(*self.inv_item_tree.get_children())
+            self.inv_status_label.config(text="【无权限】", foreground="#c0392b")
 
     def _on_user_changed(self, _event=None):
         value = self.user_var.get()
@@ -1729,6 +2502,248 @@ class App:
         ok, msg = self.manager.export_maintenance_logs(list(sel), filepath, filter_info)
         if ok:
             messagebox.showinfo("成功", f"{msg}\n\n共导出 {len(sel)} 条维修记录")
+        else:
+            messagebox.showerror("失败", msg)
+
+    def _label_to_inventory_status_key(self, label: str) -> str:
+        for k, v in INVENTORY_STATUS_LABELS.items():
+            if v == label:
+                return k
+        return "all"
+
+    def _on_inv_filter_apply(self):
+        self._inventory_filter_status = self._label_to_inventory_status_key(
+            self.inv_status_var.get())
+        self.manager.save_inventory_filter({
+            "status_filter": self._inventory_filter_status,
+        })
+        self._refresh_inventory_sessions()
+        self.status_var.set("盘点筛选已应用")
+
+    def _on_inv_filter_reset(self):
+        self._inventory_filter_status = "all"
+        self.inv_status_var.set(INVENTORY_STATUS_LABELS["all"])
+        self.manager.save_inventory_filter({})
+        self._refresh_inventory_sessions()
+        self.status_var.set("盘点筛选已重置")
+
+    def _on_inventory_selected(self, _event=None):
+        sel = self.inv_tree.selection()
+        self._selected_inventory_id = sel[0] if sel else None
+        self._selected_inventory_item_device_id = None
+        self._refresh_inventory_items()
+
+    def _on_inventory_item_selected(self, _event=None):
+        sel = self.inv_item_tree.selection()
+        self._selected_inventory_item_device_id = sel[0] if sel else None
+
+    def _refresh_inventory_sessions(self):
+        if not self.manager.has_permission("view_inventory"):
+            self.inv_tree.delete(*self.inv_tree.get_children())
+            self.inv_item_tree.delete(*self.inv_item_tree.get_children())
+            self.inv_status_label.config(text="【无权限】", foreground="#c0392b")
+            return
+        try:
+            all_sessions = self.manager.get_inventory_sessions()
+        except BusinessError:
+            self.inv_tree.delete(*self.inv_tree.get_children())
+            self.inv_item_tree.delete(*self.inv_item_tree.get_children())
+            self.inv_status_label.config(text="【无权限】", foreground="#c0392b")
+            return
+        filtered = [s for s in all_sessions
+                    if self._inventory_filter_status == "all"
+                    or s.status == self._inventory_filter_status]
+        current_selection = self.inv_tree.selection()
+        if current_selection:
+            self._selected_inventory_id = current_selection[0]
+        self.inv_tree.delete(*self.inv_tree.get_children())
+        visible_ids = set()
+        for s in sorted(filtered, key=lambda x: x.created_at, reverse=True):
+            ex_count = self.manager.get_inventory_exception_count(s)
+            self.inv_tree.insert("", "end", iid=s.id, values=(
+                s.id, s.title, s.status, len(s.items), ex_count,
+                s.created_by, s.created_at, s.completed_at or "-"
+            ), tags=(s.status,))
+            visible_ids.add(s.id)
+        if self._selected_inventory_id and self._selected_inventory_id in visible_ids:
+            try:
+                self.inv_tree.selection_set(self._selected_inventory_id)
+            except Exception:
+                pass
+        else:
+            self._selected_inventory_id = None
+        self._refresh_inventory_items()
+        total = len(all_sessions)
+        shown = len(filtered)
+        parts = [f"显示 {shown}/{total} 条"]
+        if self._inventory_filter_status != "all":
+            parts.append(f"（{INVENTORY_STATUS_LABELS[self._inventory_filter_status]}）")
+        if shown == 0 and self._inventory_filter_status != "all":
+            parts.append("- 该筛选下无记录")
+        self.inv_status_label.config(text="  ".join(parts), foreground="#2980b9")
+
+    def _refresh_inventory_items(self):
+        self.inv_item_tree.delete(*self.inv_item_tree.get_children())
+        if not self._selected_inventory_id:
+            return
+        session = self.manager.find_inventory_session(self._selected_inventory_id)
+        if not session:
+            return
+        for it in session.items:
+            tag = "unfilled" if not it.inventory_result else (
+                "exception" if it.inventory_result != InventoryItemResult.NORMAL else "normal")
+            self.inv_item_tree.insert("", "end", iid=it.device_id, values=(
+                it.device_id, it.device_name, it.original_status,
+                it.actual_status or "-",
+                it.inventory_result or "未填写",
+                it.filled_by or "-"
+            ), tags=(tag,))
+
+    def _continue_last_inventory(self):
+        if not self.manager.has_permission("fill_inventory"):
+            messagebox.showerror("无权限", "当前角色不能填写盘点。")
+            return
+        session = self.manager.get_active_inventory_session()
+        if not session:
+            messagebox.showinfo("提示", "没有找到未完成的上次盘点。")
+            return
+        self._inventory_filter_status = "all"
+        self.inv_status_var.set(INVENTORY_STATUS_LABELS["all"])
+        self._selected_inventory_id = session.id
+        self._refresh_inventory_sessions()
+        try:
+            self.inv_tree.selection_set(session.id)
+        except Exception:
+            pass
+        self.status_var.set(f"已恢复上次盘点：{session.title}")
+
+    def _create_inventory(self):
+        if not self.manager.has_permission("create_inventory"):
+            messagebox.showerror("无权限", "当前角色不能创建盘点。")
+            return
+        dlg = CreateInventoryDialog(self.root, self.manager)
+        self.root.wait_window(dlg)
+        if dlg.result:
+            self._selected_inventory_id = dlg.result.id
+            self._refresh_inventory_sessions()
+            self.status_var.set(f"盘点已创建：{dlg.result.title}")
+
+    def _fill_inventory_item(self):
+        if not self.manager.has_permission("fill_inventory"):
+            messagebox.showerror("无权限", "当前角色不能填写盘点。")
+            return
+        if not self._selected_inventory_id:
+            messagebox.showinfo("提示", "请先在盘点列表中选择一个盘点")
+            return
+        session = self.manager.find_inventory_session(self._selected_inventory_id)
+        if not session:
+            return
+        if session.status == InventoryStatus.COMPLETED:
+            messagebox.showinfo("提示", "该盘点已完成，不能再填写。")
+            return
+        if not self._selected_inventory_item_device_id:
+            messagebox.showinfo("提示", "请在盘点明细中选择要填写的设备")
+            return
+        item = self.manager._find_inventory_item(session, self._selected_inventory_item_device_id)
+        if not item:
+            return
+        dlg = FillInventoryItemDialog(self.root, self.manager, session, item)
+        self.root.wait_window(dlg)
+        if dlg.result:
+            self._refresh_inventory_sessions()
+            if self._selected_inventory_id:
+                try:
+                    self.inv_tree.selection_set(self._selected_inventory_id)
+                    self._refresh_inventory_items()
+                    if self._selected_inventory_item_device_id:
+                        self.inv_item_tree.selection_set(self._selected_inventory_item_device_id)
+                except Exception:
+                    pass
+            self.status_var.set(f"盘点项已填写：{dlg.result.inventory_result}")
+
+    def _complete_inventory(self):
+        if not self.manager.has_permission("complete_inventory"):
+            messagebox.showerror("无权限", "当前角色不能完成盘点。")
+            return
+        if not self._selected_inventory_id:
+            messagebox.showinfo("提示", "请先选择要完成的盘点")
+            return
+        session = self.manager.find_inventory_session(self._selected_inventory_id)
+        if not session:
+            return
+        if session.status == InventoryStatus.COMPLETED:
+            messagebox.showinfo("提示", "该盘点已经完成。")
+            return
+        unfilled = [it for it in session.items if not it.inventory_result]
+        if unfilled:
+            if not messagebox.askyesno(
+                "未填写完成",
+                f"还有 {len(unfilled)} 台设备未填写盘点结果。\n"
+                f"确定要标记为已完成吗？（不建议）"
+            ):
+                return
+        remark = simpledialog.askstring("完成盘点", "完成说明（可选）:", parent=self.root)
+        try:
+            completed = self.manager.complete_inventory(session.id, remark or "")
+            ex_count = self.manager.get_inventory_exception_count(completed)
+            messagebox.showinfo(
+                "成功",
+                f"盘点【{completed.title}】已完成！\n"
+                f"共 {len(completed.items)} 台设备，异常 {ex_count} 台。"
+            )
+            self._refresh_inventory_sessions()
+            self.status_var.set(f"盘点已完成：{completed.title}")
+        except BusinessError as e:
+            messagebox.showerror("失败", str(e))
+
+    def _view_inventory_detail(self):
+        if not self.manager.has_permission("view_inventory"):
+            messagebox.showerror("无权限", "当前角色不能查看盘点详情。")
+            return
+        if not self._selected_inventory_id:
+            messagebox.showinfo("提示", "请先选择要查看的盘点")
+            return
+        session = self.manager.find_inventory_session(self._selected_inventory_id)
+        if not session:
+            return
+        InventoryDetailDialog(self.root, self.manager, session)
+
+    def _export_inventory(self):
+        if not self.manager.has_permission("export_inventory"):
+            messagebox.showerror("无权限", "当前角色不能导出盘点。")
+            return
+        if not self._selected_inventory_id:
+            messagebox.showinfo("提示", "请先选择要导出的盘点")
+            return
+        session = self.manager.find_inventory_session(self._selected_inventory_id)
+        if not session:
+            return
+        if session.status != InventoryStatus.COMPLETED:
+            messagebox.showerror("错误", "只有已完成的盘点才能导出。")
+            return
+        if not self._check_export_dir():
+            return
+        status_desc = INVENTORY_STATUS_LABELS.get(self._inventory_filter_status, "全部")
+        default_name = f"月度盘点_{session.title}_{_now_str().replace(':', '-').replace(' ', '_')}"
+        filepath = filedialog.asksaveasfilename(
+            title="导出盘点结果",
+            initialdir=self.manager.config.export_dir,
+            initialfile=default_name,
+            defaultextension=".csv",
+            filetypes=[("CSV 表格", "*.csv"), ("JSON 数据", "*.json")]
+        )
+        if not filepath:
+            return
+        if not filepath.startswith(self.manager.config.export_dir):
+            if not messagebox.askyesno("目录不匹配",
+                                       f"所选路径不在设置的导出目录下。\n"
+                                       f"导出目录: {self.manager.config.export_dir}\n"
+                                       f"确定继续导出？"):
+                return
+        ok, msg = self.manager.export_inventory_session(session.id, filepath)
+        if ok:
+            ex_count = self.manager.get_inventory_exception_count(session)
+            messagebox.showinfo("成功", f"{msg}\n\n共 {len(session.items)} 台设备，异常 {ex_count} 台")
         else:
             messagebox.showerror("失败", msg)
 

@@ -1000,24 +1000,35 @@ class EquipmentManager:
 
     def _filter_devices_for_inventory(self, category: str = "",
                                        status_filter: str = "all",
-                                       keyword: str = "") -> List[Device]:
+                                       keyword: str = "",
+                                       storage_location: str = "",
+                                       responsible_person: str = "") -> List[Device]:
         result = list(self.devices)
         if category and category.strip():
             cat = category.strip()
             result = [d for d in result if d.category == cat]
         if status_filter and status_filter != "all":
             result = [d for d in result if d.status == status_filter]
+        if storage_location and storage_location.strip():
+            loc = storage_location.strip()
+            result = [d for d in result if d.storage_location == loc]
+        if responsible_person and responsible_person.strip():
+            rp = responsible_person.strip()
+            result = [d for d in result if d.responsible_person == rp]
         if keyword and keyword.strip():
             kw = keyword.strip().lower()
             result = [d for d in result
                       if kw in d.name.lower()
                       or kw in (d.model or "").lower()
                       or kw in (d.serial_no or "").lower()
-                      or kw in d.id.lower()]
+                      or kw in d.id.lower()
+                      or kw in (d.storage_location or "").lower()
+                      or kw in (d.responsible_person or "").lower()]
         return result
 
     def create_inventory(self, title: str, category: str = "",
                          status_filter: str = "all", keyword: str = "",
+                         storage_location: str = "", responsible_person: str = "",
                          device_ids: Optional[List[str]] = None,
                          remark: str = "") -> InventorySession:
         self._require_permission("create_inventory")
@@ -1030,7 +1041,8 @@ class EquipmentManager:
                 raise BusinessError("未选中任何有效设备")
         else:
             selected_devices = self._filter_devices_for_inventory(
-                category, status_filter, keyword
+                category, status_filter, keyword,
+                storage_location, responsible_person
             )
             if not selected_devices:
                 raise BusinessError("当前筛选条件下没有符合条件的设备")
@@ -1048,6 +1060,8 @@ class EquipmentManager:
             "category": category or "",
             "status_filter": status_filter or "all",
             "keyword": keyword or "",
+            "storage_location": storage_location or "",
+            "responsible_person": responsible_person or "",
             "manual_device_count": len(device_ids) if device_ids else 0,
             "total_devices": len(selected_devices),
         }
@@ -1062,6 +1076,7 @@ class EquipmentManager:
             remark=remark.strip() if remark else "",
         )
         self.inventory_sessions.append(session)
+        self.config.last_active_inventory_session_id = session.id
         self.save_all()
         return session
 
@@ -1219,3 +1234,111 @@ class EquipmentManager:
 
     def get_last_inventory_filter(self) -> dict:
         return dict(self.config.last_inventory_filter or {})
+
+    def get_unique_categories(self) -> List[str]:
+        cats = sorted({d.category for d in self.devices if d.category})
+        return cats
+
+    def get_unique_storage_locations(self) -> List[str]:
+        locs = sorted({d.storage_location for d in self.devices if d.storage_location})
+        return locs
+
+    def get_unique_responsible_persons(self) -> List[str]:
+        rps = sorted({d.responsible_person for d in self.devices if d.responsible_person})
+        return rps
+
+    def set_active_inventory_session(self, session_id: str):
+        self.config.last_active_inventory_session_id = session_id
+        self.save_all()
+
+    def get_active_inventory_session(self) -> Optional[InventorySession]:
+        sid = self.config.last_active_inventory_session_id
+        if not sid:
+            return None
+        session = self.find_inventory_session(sid)
+        if session and session.status != InventoryStatus.COMPLETED:
+            return session
+        return None
+
+    def clear_active_inventory_session(self):
+        self.config.last_active_inventory_session_id = ""
+        self.save_all()
+
+    def get_inventory_progress(self, session: InventorySession) -> dict:
+        total = len(session.items)
+        filled = sum(1 for it in session.items if it.inventory_result)
+        exceptions = self.get_inventory_exception_count(session)
+        normal = filled - exceptions
+        return {
+            "total": total,
+            "filled": filled,
+            "remaining": total - filled,
+            "exceptions": exceptions,
+            "normal": normal,
+            "progress_pct": round((filled / total * 100), 1) if total > 0 else 0.0,
+        }
+
+    def get_inventory_diff_details(self, session: InventorySession) -> List[dict]:
+        details = []
+        for it in session.items:
+            dev = self.find_device(it.device_id)
+            if not dev:
+                continue
+            diffs = []
+            if it.actual_status and it.actual_status != it.original_status:
+                diffs.append(f"状态: {it.original_status} → {it.actual_status}")
+            if it.actual_location and it.actual_location != (dev.storage_location or ""):
+                diffs.append(f"位置: {dev.storage_location or '未记录'} → {it.actual_location}")
+            if it.missing_accessories:
+                diffs.append(f"缺失配件: {', '.join(it.missing_accessories)}")
+            if it.inventory_result and it.inventory_result != InventoryItemResult.NORMAL:
+                diffs.append(f"盘点结果: {it.inventory_result}")
+            details.append({
+                "device_id": it.device_id,
+                "device_name": it.device_name,
+                "original_status": it.original_status,
+                "actual_status": it.actual_status,
+                "original_location": dev.storage_location or "",
+                "actual_location": it.actual_location,
+                "result": it.inventory_result,
+                "remark": it.remark,
+                "diffs": diffs,
+                "has_diff": len(diffs) > 0,
+                "filled_by": it.filled_by,
+                "filled_at": it.filled_at,
+            })
+        return details
+
+    def get_inventory_exception_summary(self, session: InventorySession) -> dict:
+        summary = {
+            "total": len(session.items),
+            "normal": 0,
+            "missing": 0,
+            "damaged": 0,
+            "location_wrong": 0,
+            "accessory_missing": 0,
+            "other": 0,
+            "unfilled": 0,
+            "by_result": {},
+        }
+        for it in session.items:
+            if not it.inventory_result:
+                summary["unfilled"] += 1
+                continue
+            if it.inventory_result == InventoryItemResult.NORMAL:
+                summary["normal"] += 1
+            elif it.inventory_result == InventoryItemResult.MISSING:
+                summary["missing"] += 1
+            elif it.inventory_result == InventoryItemResult.DAMAGED:
+                summary["damaged"] += 1
+            elif it.inventory_result == InventoryItemResult.LOCATION_WRONG:
+                summary["location_wrong"] += 1
+            elif it.inventory_result == InventoryItemResult.ACCESSORY_MISSING:
+                summary["accessory_missing"] += 1
+            elif it.inventory_result == InventoryItemResult.OTHER:
+                summary["other"] += 1
+            key = it.inventory_result
+            if key not in summary["by_result"]:
+                summary["by_result"][key] = []
+            summary["by_result"][key].append(it.device_name)
+        return summary
