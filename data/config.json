@@ -9,5 +9,6 @@
   "last_maintenance_filter": {},
   "maintenance_records_snapshot": {},
   "last_inventory_filter": {},
-  "last_active_inventory_session_id": ""
+  "last_active_inventory_session_id": "",
+  "last_handoff_filter": {}
 }
