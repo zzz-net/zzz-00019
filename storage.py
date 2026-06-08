@@ -1,10 +1,12 @@
 import os
 import json
 import csv
-from typing import List, Optional
+import copy
+from typing import List, Optional, Tuple, Dict
 from models import (
     Device, Borrower, BorrowRecord, User, AppConfig,
-    DeviceStatus, RecordStatus, UserRole, Accessory, _now_str
+    DeviceStatus, RecordStatus, UserRole, Accessory, _now_str,
+    ImportPrecheckSummary, ImportLogEntry
 )
 
 
@@ -14,6 +16,18 @@ BORROWERS_FILE = os.path.join(DATA_DIR, "borrowers.json")
 RECORDS_FILE = os.path.join(DATA_DIR, "records.json")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+IMPORT_LOGS_FILE = os.path.join(DATA_DIR, "import_logs.json")
+
+
+IMPORT_REQUIRED_FIELDS = [
+    "device_id", "borrower_id", "borrow_time"
+]
+IMPORT_OPTIONAL_FIELDS = [
+    "device_name", "borrower_name", "borrower_department",
+    "expected_return_time", "actual_return_time", "status",
+    "check_out_operator", "check_in_operator", "inspect_operator",
+    "close_operator", "inspect_remark", "remark"
+]
 
 
 def _ensure_data_dir():
@@ -274,3 +288,73 @@ def seed_sample_data():
             last_user="admin"
         )
         save_config(config)
+
+
+def save_import_logs(logs: List[ImportLogEntry]):
+    _save_json(IMPORT_LOGS_FILE, [l.to_dict() for l in logs])
+
+
+def load_import_logs() -> List[ImportLogEntry]:
+    data = _load_json(IMPORT_LOGS_FILE, [])
+    return [ImportLogEntry.from_dict(d) for d in data]
+
+
+def append_import_log(entry: ImportLogEntry):
+    logs = load_import_logs()
+    logs.append(entry)
+    save_import_logs(logs)
+
+
+def parse_import_csv(filepath: str) -> Tuple[bool, str, List[dict]]:
+    if not os.path.exists(filepath):
+        return False, f"文件不存在：{filepath}", []
+    try:
+        rows = []
+        with open(filepath, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames or []
+            if not fieldnames:
+                return False, "CSV 文件为空或没有表头", []
+            for i, row in enumerate(reader, start=2):
+                clean_row = {}
+                for k, v in row.items():
+                    if k is not None:
+                        clean_row[str(k).strip()] = str(v).strip() if v else ""
+                clean_row["_row"] = i
+                rows.append(clean_row)
+        return True, "", rows
+    except (IOError, OSError, csv.Error) as e:
+        return False, f"CSV 解析失败：{e}", []
+
+
+def parse_import_json(filepath: str) -> Tuple[bool, str, List[dict]]:
+    if not os.path.exists(filepath):
+        return False, f"文件不存在：{filepath}", []
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            return False, "JSON 根节点必须是数组", []
+        rows = []
+        for i, item in enumerate(data, start=1):
+            if not isinstance(item, dict):
+                return False, f"第 {i} 项不是对象", []
+            clean_row = {str(k).strip(): (str(v).strip() if isinstance(v, str) else v)
+                         for k, v in item.items()}
+            clean_row["_row"] = i
+            rows.append(clean_row)
+        return True, "", rows
+    except (IOError, OSError, json.JSONDecodeError) as e:
+        return False, f"JSON 解析失败：{e}", []
+
+
+def parse_import_file(filepath: str) -> Tuple[bool, str, List[dict], str]:
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext == ".csv":
+        ok, msg, rows = parse_import_csv(filepath)
+        return ok, msg, rows, "csv"
+    elif ext == ".json":
+        ok, msg, rows = parse_import_json(filepath)
+        return ok, msg, rows, "json"
+    else:
+        return False, f"不支持的文件格式：{ext}（仅支持 .csv 和 .json）", [], ext

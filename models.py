@@ -38,10 +38,10 @@ class UserRole:
         ADMIN: ["add_device", "edit_device", "delete_device",
                 "add_borrower", "borrow_device", "return_device",
                 "inspect_return", "freeze_device", "unfreeze_device",
-                "close_record", "export_data", "view_all"],
+                "close_record", "export_data", "import_records", "view_all"],
         BORROWER: ["borrow_device", "view_own", "export_data"],
         INSPECTOR: ["inspect_return", "return_device", "close_record",
-                    "view_all", "export_data"],
+                    "view_all", "export_data", "import_records"],
     }
 
     @classmethod
@@ -185,9 +185,51 @@ class User:
 
 
 @dataclass
+class ImportPrecheckSummary:
+    total: int = 0
+    importable: int = 0
+    field_missing: int = 0
+    device_not_found: int = 0
+    device_status_conflict: int = 0
+    borrower_not_found: int = 0
+    duplicate: int = 0
+    issues: List[dict] = field(default_factory=list)
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict):
+        return cls(**d)
+
+
+@dataclass
+class ImportLogEntry:
+    timestamp: str = ""
+    operator: str = ""
+    operator_role: str = ""
+    file_path: str = ""
+    file_format: str = ""
+    total: int = 0
+    success_count: int = 0
+    fail_count: int = 0
+    fail_reasons: List[str] = field(default_factory=list)
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict):
+        return cls(**d)
+
+
+@dataclass
 class AppConfig:
     export_dir: str = ""
     last_user: str = ""
+    last_import_dir: str = ""
+    last_import_format: str = ""
+    last_import_summary: dict = field(default_factory=dict)
 
     def to_dict(self):
         return asdict(self)

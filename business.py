@@ -1,7 +1,10 @@
-from typing import List, Optional, Tuple
+import os
+import copy
+from typing import List, Optional, Tuple, Dict, Any
 from models import (
     Device, Borrower, BorrowRecord, User, Accessory,
-    DeviceStatus, RecordStatus, UserRole, _now_str
+    DeviceStatus, RecordStatus, UserRole, _now_str,
+    ImportPrecheckSummary, ImportLogEntry
 )
 import storage
 
@@ -403,3 +406,276 @@ class EquipmentManager:
                     if r.borrower_name == self.current_user.display_name
                     or r.borrower_id == self.current_user.username]
         return self.records
+
+    def _make_row_issue(self, row: dict, kind: str, detail: str) -> dict:
+        return {
+            "row": row.get("_row", "?"),
+            "kind": kind,
+            "detail": detail,
+            "device_id": row.get("device_id", ""),
+            "borrower_id": row.get("borrower_id", ""),
+        }
+
+    def precheck_import_file(self, filepath: str) -> Tuple[bool, str, ImportPrecheckSummary]:
+        self._require_permission("import_records")
+
+        ok, msg, rows, fmt = storage.parse_import_file(filepath)
+        if not ok:
+            return False, msg, ImportPrecheckSummary()
+
+        self.config.last_import_dir = os.path.dirname(filepath)
+        self.config.last_import_format = fmt
+
+        summary = ImportPrecheckSummary(total=len(rows))
+        seen_keys = set()
+
+        for row in rows:
+            issues_for_row = []
+
+            missing_fields = []
+            for f in storage.IMPORT_REQUIRED_FIELDS:
+                val = row.get(f, "")
+                if val is None or (isinstance(val, str) and not val.strip()):
+                    missing_fields.append(f)
+            if missing_fields:
+                summary.field_missing += 1
+                issues_for_row.append(self._make_row_issue(
+                    row, "字段缺失",
+                    f"缺少必填字段：{', '.join(missing_fields)}"
+                ))
+
+            device = None
+            if not issues_for_row or "device_id" not in missing_fields:
+                device_id = str(row.get("device_id", "")).strip()
+                device = self.find_device(device_id)
+                if not device:
+                    summary.device_not_found += 1
+                    issues_for_row.append(self._make_row_issue(
+                        row, "设备不存在",
+                        f"设备ID【{device_id}】在系统中不存在"
+                    ))
+
+            borrower = None
+            if not issues_for_row or "borrower_id" not in missing_fields:
+                borrower_id = str(row.get("borrower_id", "")).strip()
+                borrower = self.find_borrower(borrower_id)
+                if not borrower:
+                    summary.borrower_not_found += 1
+                    issues_for_row.append(self._make_row_issue(
+                        row, "借用人不存在",
+                        f"借用人ID【{borrower_id}】在系统中不存在"
+                    ))
+
+            if device and device.status in (DeviceStatus.BORROWED, DeviceStatus.INSPECTING):
+                active = self.get_active_record_for_device(device.id)
+                if active:
+                    summary.device_status_conflict += 1
+                    issues_for_row.append(self._make_row_issue(
+                        row, "设备状态冲突",
+                        f"设备【{device.name}】当前状态为【{device.status}】，"
+                        f"已有进行中的借用记录"
+                    ))
+
+            dup_key = None
+            if device and borrower:
+                dup_key = (device.id, borrower.id, str(row.get("borrow_time", "")).strip())
+                if dup_key in seen_keys:
+                    summary.duplicate += 1
+                    issues_for_row.append(self._make_row_issue(
+                        row, "重复记录",
+                        f"同一文件内：设备【{device.id}】+ 借用人【{borrower.id}】"
+                        f"+ 借出时间相同"
+                    ))
+                else:
+                    for existing in self.records:
+                        if (existing.device_id == device.id
+                                and existing.borrower_id == borrower.id
+                                and existing.borrow_time == str(row.get("borrow_time", "")).strip()):
+                            summary.duplicate += 1
+                            issues_for_row.append(self._make_row_issue(
+                                row, "重复记录",
+                                f"与已有记录【{existing.id}】重复：相同设备、借用人、借出时间"
+                            ))
+                            break
+
+            if dup_key and not any(i["kind"] == "重复记录" for i in issues_for_row):
+                seen_keys.add(dup_key)
+
+            if issues_for_row:
+                summary.issues.extend(issues_for_row)
+            else:
+                summary.importable += 1
+
+        self.config.last_import_summary = summary.to_dict()
+        self.save_all()
+
+        return True, "", summary
+
+    def commit_import(self, filepath: str) -> Tuple[bool, str, int, int]:
+        self._require_permission("import_records")
+
+        ok, msg, rows, fmt = storage.parse_import_file(filepath)
+        if not ok:
+            self._append_import_log(filepath, fmt, 0, 0, 0, [msg])
+            return False, msg, 0, 0
+
+        pre_ok, pre_msg, summary = self.precheck_import_file(filepath)
+        if not pre_ok:
+            self._append_import_log(filepath, fmt, len(rows), 0, len(rows), [pre_msg])
+            return False, pre_msg, 0, 0
+        if summary.importable == 0:
+            reason = "没有可导入的记录：" + "；".join([
+                f"字段缺失 {summary.field_missing}",
+                f"设备不存在 {summary.device_not_found}",
+                f"设备状态冲突 {summary.device_status_conflict}",
+                f"借用人不存在 {summary.borrower_not_found}",
+                f"重复记录 {summary.duplicate}",
+            ])
+            self._append_import_log(filepath, fmt, len(rows), 0, len(rows), [reason])
+            return False, reason, 0, 0
+
+        devices_backup = copy.deepcopy(self.devices)
+        records_backup = copy.deepcopy(self.records)
+        device_state: Dict[str, str] = {d.id: d.status for d in self.devices}
+
+        success_count = 0
+        fail_count = 0
+        fail_reasons = []
+        imported_records: List[BorrowRecord] = []
+
+        try:
+            for row in rows:
+                missing = [f for f in storage.IMPORT_REQUIRED_FIELDS
+                           if not str(row.get(f, "")).strip()]
+                if missing:
+                    fail_count += 1
+                    fail_reasons.append(f"第{row.get('_row','?')}行: 字段缺失 {', '.join(missing)}")
+                    continue
+
+                device_id = str(row.get("device_id", "")).strip()
+                borrower_id = str(row.get("borrower_id", "")).strip()
+                borrow_time = str(row.get("borrow_time", "")).strip()
+
+                device = self.find_device(device_id)
+                if not device:
+                    fail_count += 1
+                    fail_reasons.append(f"第{row.get('_row','?')}行: 设备不存在【{device_id}】")
+                    continue
+
+                borrower = self.find_borrower(borrower_id)
+                if not borrower:
+                    fail_count += 1
+                    fail_reasons.append(f"第{row.get('_row','?')}行: 借用人不存在【{borrower_id}】")
+                    continue
+
+                if device_state.get(device.id) in (DeviceStatus.BORROWED, DeviceStatus.INSPECTING):
+                    fail_count += 1
+                    fail_reasons.append(f"第{row.get('_row','?')}行: 设备状态冲突【{device.name}】")
+                    continue
+
+                is_dup = False
+                for existing in imported_records + self.records:
+                    if (existing.device_id == device.id
+                            and existing.borrower_id == borrower.id
+                            and existing.borrow_time == borrow_time):
+                        is_dup = True
+                        break
+                if is_dup:
+                    fail_count += 1
+                    fail_reasons.append(f"第{row.get('_row','?')}行: 重复记录")
+                    continue
+
+                status_str = str(row.get("status", "")).strip() or RecordStatus.BORROWED
+                valid_statuses = [RecordStatus.BORROWED, RecordStatus.INSPECTING,
+                                  RecordStatus.RETURNED, RecordStatus.FROZEN]
+                if status_str not in valid_statuses:
+                    status_str = RecordStatus.BORROWED
+
+                from_status = device_state.get(device.id, DeviceStatus.AVAILABLE)
+
+                if status_str == RecordStatus.BORROWED:
+                    new_device_status = DeviceStatus.BORROWED
+                elif status_str == RecordStatus.INSPECTING:
+                    new_device_status = DeviceStatus.INSPECTING
+                elif status_str == RecordStatus.RETURNED:
+                    new_device_status = DeviceStatus.AVAILABLE
+                elif status_str == RecordStatus.FROZEN:
+                    new_device_status = DeviceStatus.FROZEN
+                else:
+                    new_device_status = DeviceStatus.BORROWED
+
+                device.status = new_device_status
+                device_state[device.id] = new_device_status
+
+                record = BorrowRecord(
+                    device_id=device.id,
+                    device_name=device.name,
+                    borrower_id=borrower.id,
+                    borrower_name=borrower.name,
+                    borrower_department=borrower.department,
+                    borrow_time=borrow_time,
+                    expected_return_time=str(row.get("expected_return_time", "")).strip(),
+                    actual_return_time=str(row.get("actual_return_time", "")).strip(),
+                    status=status_str,
+                    check_out_operator=str(row.get("check_out_operator", "")).strip()
+                                      or (self.current_user.username if self.current_user else ""),
+                    check_in_operator=str(row.get("check_in_operator", "")).strip(),
+                    inspect_operator=str(row.get("inspect_operator", "")).strip(),
+                    close_operator=str(row.get("close_operator", "")).strip(),
+                    inspect_remark=str(row.get("inspect_remark", "")).strip(),
+                    remark=str(row.get("remark", "")).strip(),
+                )
+                record.add_history(
+                    from_status, status_str,
+                    self.current_user.username if self.current_user else "system",
+                    self.current_user.role if self.current_user else UserRole.ADMIN,
+                    f"批量导入（来自文件：{os.path.basename(filepath)}）"
+                )
+                self.records.append(record)
+                imported_records.append(record)
+                success_count += 1
+
+            self.save_all()
+            self._append_import_log(filepath, fmt, len(rows), success_count, fail_count, fail_reasons)
+            return True, f"成功导入 {success_count} 条，失败 {fail_count} 条", success_count, fail_count
+
+        except Exception as e:
+            self.devices = devices_backup
+            self.records = records_backup
+            try:
+                self.save_all()
+            except Exception:
+                pass
+            rollback_reason = f"导入过程发生异常，整批已回滚：{e}"
+            self._append_import_log(filepath, fmt, len(rows), 0, len(rows), [rollback_reason])
+            return False, rollback_reason, 0, 0
+
+    def _append_import_log(self, filepath: str, fmt: str, total: int,
+                           success: int, fail: int, reasons: List[str]):
+        try:
+            entry = ImportLogEntry(
+                timestamp=_now_str(),
+                operator=self.current_user.username if self.current_user else "",
+                operator_role=self.current_user.role if self.current_user else "",
+                file_path=filepath,
+                file_format=fmt,
+                total=total,
+                success_count=success,
+                fail_count=fail,
+                fail_reasons=reasons,
+            )
+            storage.append_import_log(entry)
+        except Exception:
+            pass
+
+    def get_import_logs(self) -> List[ImportLogEntry]:
+        self._require_permission("import_records")
+        return storage.load_import_logs()
+
+    def get_last_import_info(self) -> dict:
+        self._require_permission("import_records")
+        return {
+            "last_import_dir": self.config.last_import_dir,
+            "last_import_format": self.config.last_import_format,
+            "last_import_summary": self.config.last_import_summary,
+        }

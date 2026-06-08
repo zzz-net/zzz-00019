@@ -26,6 +26,7 @@ def setup_test_env():
     storage.RECORDS_FILE = os.path.join(TEST_DATA_DIR, "records.json")
     storage.USERS_FILE = os.path.join(TEST_DATA_DIR, "users.json")
     storage.CONFIG_FILE = os.path.join(TEST_DATA_DIR, "config.json")
+    storage.IMPORT_LOGS_FILE = os.path.join(TEST_DATA_DIR, "import_logs.json")
 
 
 def cleanup_test_env():
@@ -543,6 +544,291 @@ def test_last_valid_dir_preserved_across_restart():
                 "目录被删除后 can_write 返回 False")
 
 
+def _write_csv(path: str, rows: list):
+    import csv
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        if not rows:
+            return
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
+
+
+def _write_json(path: str, data: list):
+    import json
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def test_import_permission_denied_for_borrower():
+    print("\n=== 测试18: 借用人无批量导入权限 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("zhangsan")
+
+    def try_precheck():
+        mgr.precheck_import_file("dummy.csv")
+
+    def try_commit():
+        mgr.commit_import("dummy.csv")
+
+    def try_logs():
+        mgr.get_import_logs()
+
+    assert_raises(try_precheck, BusinessError, "借用人预检抛出权限异常")
+    assert_raises(try_commit, BusinessError, "借用人提交导入抛出权限异常")
+    assert_raises(try_logs, BusinessError, "借用人查看日志抛出权限异常")
+    assert_true(not mgr.has_permission("import_records"),
+                "借用人角色无 import_records 权限")
+
+
+def test_import_admin_and_inspector_allowed():
+    print("\n=== 测试19: 管理员和验收人拥有导入权限 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+    assert_true(mgr.has_permission("import_records"), "管理员有 import_records 权限")
+    mgr.switch_user("wangwu")
+    assert_true(mgr.has_permission("import_records"), "验收人有 import_records 权限")
+
+
+def test_import_precheck_detects_all_issues():
+    print("\n=== 测试20: 预检正确识别各类问题 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+
+    avail_dev = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+    borrowed_dev = next(d for d in mgr.devices if d.status == DeviceStatus.BORROWED)
+    frozen_dev = next(d for d in mgr.devices if d.status == DeviceStatus.FROZEN)
+    borrower = mgr.borrowers[0]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        rows = [
+            {"device_id": "", "borrower_id": borrower.id, "borrow_time": "2026-06-01 10:00:00"},
+            {"device_id": avail_dev.id, "borrower_id": "", "borrow_time": "2026-06-01 10:00:00"},
+            {"device_id": avail_dev.id, "borrower_id": borrower.id, "borrow_time": ""},
+            {"device_id": "NO_SUCH_DEVICE", "borrower_id": borrower.id, "borrow_time": "2026-06-01 10:00:00"},
+            {"device_id": avail_dev.id, "borrower_id": "NO_SUCH_BORROWER", "borrow_time": "2026-06-01 10:00:00"},
+            {"device_id": borrowed_dev.id, "borrower_id": borrower.id, "borrow_time": "2026-06-02 10:00:00"},
+            {"device_id": avail_dev.id, "borrower_id": borrower.id, "borrow_time": "2026-06-03 10:00:00"},
+            {"device_id": avail_dev.id, "borrower_id": borrower.id, "borrow_time": "2026-06-03 10:00:00"},
+        ]
+        csv_path = os.path.join(tmpdir, "precheck.csv")
+        _write_csv(csv_path, rows)
+
+        ok, msg, summary = mgr.precheck_import_file(csv_path)
+        assert_true(ok, "预检执行成功：" + msg)
+        assert_eq(summary.total, 8, "总数为 8")
+        assert_true(summary.field_missing >= 3, f"字段缺失 >= 3（实际 {summary.field_missing}）")
+        assert_eq(summary.device_not_found, 1, "设备不存在 1 条")
+        assert_eq(summary.borrower_not_found, 1, "借用人不存在 1 条")
+        assert_true(summary.device_status_conflict >= 1,
+                    f"设备状态冲突 >= 1（实际 {summary.device_status_conflict}）")
+        assert_true(summary.duplicate >= 1, f"重复记录 >= 1（实际 {summary.duplicate}）")
+        assert_true(len(summary.issues) > 0, "问题明细列表非空")
+        kinds = {i["kind"] for i in summary.issues}
+        assert_true("字段缺失" in kinds, "问题类型包含：字段缺失")
+        assert_true("设备不存在" in kinds, "问题类型包含：设备不存在")
+        assert_true("借用人不存在" in kinds, "问题类型包含：借用人不存在")
+
+
+def test_import_csv_and_json_success():
+    print("\n=== 测试21: CSV / JSON 双格式成功导入 ===")
+    for fmt_name, writer in [("CSV", _write_csv), ("JSON", _write_json)]:
+        mgr = _fresh_manager()
+        mgr.switch_user("admin")
+
+        avail_devs = [d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE]
+        assert_true(len(avail_devs) >= 2, f"可用设备 >= 2（{fmt_name}）")
+        borrower = mgr.borrowers[0]
+
+        records_before = len(mgr.records)
+        dev0_status_before = avail_devs[0].status
+        dev1_status_before = avail_devs[1].status
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows = [
+                {
+                    "device_id": avail_devs[0].id,
+                    "borrower_id": borrower.id,
+                    "borrow_time": "2026-06-01 09:00:00",
+                    "expected_return_time": "2026-06-05 18:00:00",
+                    "status": RecordStatus.BORROWED,
+                    "remark": f"{fmt_name} 导入测试 #1",
+                },
+                {
+                    "device_id": avail_devs[1].id,
+                    "borrower_id": borrower.id,
+                    "borrow_time": "2026-06-02 14:00:00",
+                    "expected_return_time": "2026-06-06 18:00:00",
+                    "status": RecordStatus.BORROWED,
+                    "remark": f"{fmt_name} 导入测试 #2",
+                },
+            ]
+            path = os.path.join(tmpdir, f"import_ok.{fmt_name.lower()}")
+            writer(path, rows)
+
+            ok, msg, sc, fc = mgr.commit_import(path)
+            assert_true(ok, f"{fmt_name} 导入成功：{msg}")
+            assert_eq(sc, 2, f"{fmt_name} 成功 2 条")
+            assert_eq(fc, 0, f"{fmt_name} 失败 0 条")
+            assert_eq(len(mgr.records), records_before + 2,
+                      f"{fmt_name} 记录数 +2")
+
+            d0 = mgr.find_device(avail_devs[0].id)
+            d1 = mgr.find_device(avail_devs[1].id)
+            assert_eq(d0.status, DeviceStatus.BORROWED,
+                      f"{fmt_name} 设备 0 状态同步为已借出")
+            assert_eq(d1.status, DeviceStatus.BORROWED,
+                      f"{fmt_name} 设备 1 状态同步为已借出")
+
+            new_records = [r for r in mgr.records
+                           if r.remark and f"{fmt_name} 导入测试" in r.remark]
+            assert_eq(len(new_records), 2, f"{fmt_name} 找到 2 条新记录")
+            for r in new_records:
+                assert_true(len(r.history) >= 1,
+                            f"{fmt_name} 新记录带状态历史")
+                assert_true("批量导入" in r.history[-1].remark,
+                            f"{fmt_name} 历史备注包含'批量导入'")
+                assert_eq(r.check_out_operator, "admin",
+                          f"{fmt_name} 操作员正确")
+
+
+def test_import_rollback_on_conflict():
+    print("\n=== 测试22: 中途冲突整批回滚，不留半条记录 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+
+    avail_dev = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+    borrower = mgr.borrowers[0]
+    records_before = len(mgr.records)
+    devices_snapshot = [(d.id, d.status) for d in mgr.devices]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        rows = [
+            {
+                "device_id": avail_dev.id,
+                "borrower_id": borrower.id,
+                "borrow_time": "2026-06-01 10:00:00",
+                "status": RecordStatus.BORROWED,
+            },
+        ]
+        path = os.path.join(tmpdir, "rollback.json")
+        _write_json(path, rows)
+
+        original_save_all = EquipmentManager.save_all
+        call_counter = {"n": 0}
+
+        def patched_save_all(self_inner):
+            call_counter["n"] += 1
+            if call_counter["n"] >= 2:
+                raise RuntimeError("模拟持久化写入故障")
+            return original_save_all(self_inner)
+
+        EquipmentManager.save_all = patched_save_all
+        try:
+            ok, msg, sc, fc = mgr.commit_import(path)
+        finally:
+            EquipmentManager.save_all = original_save_all
+
+        assert_true(not ok, "导入返回失败")
+        assert_true("回滚" in msg, f"失败信息包含'回滚'（实际：{msg[:80]}）")
+        assert_eq(len(mgr.records), records_before,
+                  "回滚后记录数与导入前一致")
+        for (did, dstatus), d in zip(devices_snapshot, mgr.devices):
+            assert_eq(d.id, did, "设备ID顺序未变")
+            assert_eq(d.status, dstatus,
+                      f"设备 {did} 状态回滚到 {dstatus}")
+
+        mgr2 = EquipmentManager()
+        assert_eq(len(mgr2.records), records_before,
+                  "跨重启：持久化文件也已回滚，无半条记录")
+
+
+def test_import_config_persisted_across_restart():
+    print("\n=== 测试23: 导入目录/格式/预检摘要跨重启保留 ===")
+    setup_test_env()
+    mgr1 = EquipmentManager()
+    mgr1.switch_user("admin")
+
+    avail_dev = next(d for d in mgr1.devices if d.status == DeviceStatus.AVAILABLE)
+    borrower = mgr1.borrowers[0]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        rows = [
+            {"device_id": "BAD_ID", "borrower_id": borrower.id, "borrow_time": "2026-06-01 10:00:00"},
+            {"device_id": avail_dev.id, "borrower_id": borrower.id, "borrow_time": "2026-06-01 11:00:00"},
+        ]
+        path = os.path.join(tmpdir, "precheck_config.csv")
+        _write_csv(path, rows)
+
+        ok, _, summary = mgr1.precheck_import_file(path)
+        assert_true(ok, "预检成功")
+        assert_eq(mgr1.config.last_import_dir, tmpdir,
+                  "内存中 last_import_dir 已记录")
+        assert_eq(mgr1.config.last_import_format, "csv",
+                  "内存中 last_import_format 已记录")
+        assert_true(len(mgr1.config.last_import_summary) > 0,
+                    "内存中 last_import_summary 非空")
+
+        mgr2 = EquipmentManager()
+        mgr2.switch_user("admin")
+        assert_eq(mgr2.config.last_import_dir, tmpdir,
+                  "跨重启：last_import_dir 保留")
+        assert_eq(mgr2.config.last_import_format, "csv",
+                  "跨重启：last_import_format 保留")
+        assert_true(len(mgr2.config.last_import_summary) > 0,
+                    "跨重启：last_import_summary 保留")
+        info = mgr2.get_last_import_info()
+        assert_eq(info["last_import_dir"], tmpdir, "get_last_import_info 返回目录")
+        assert_eq(info["last_import_format"], "csv", "get_last_import_info 返回格式")
+        assert_true("total" in info["last_import_summary"],
+                    "摘要中包含 total 字段")
+
+
+def test_import_log_generated():
+    print("\n=== 测试24: 导入操作日志生成与持久化 ===")
+    setup_test_env()
+    mgr1 = EquipmentManager()
+    mgr1.switch_user("admin")
+
+    avail_dev = next(d for d in mgr1.devices if d.status == DeviceStatus.AVAILABLE)
+    borrower = mgr1.borrowers[0]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        rows_ok = [
+            {
+                "device_id": avail_dev.id,
+                "borrower_id": borrower.id,
+                "borrow_time": "2026-06-01 09:00:00",
+                "status": RecordStatus.BORROWED,
+                "remark": "日志测试",
+            },
+            {"device_id": "", "borrower_id": borrower.id, "borrow_time": "2026-06-01 10:00:00"},
+        ]
+        path_ok = os.path.join(tmpdir, "log_ok.csv")
+        _write_csv(path_ok, rows_ok)
+        ok, msg, sc, fc = mgr1.commit_import(path_ok)
+        assert_true(ok, "混合成功/失败的导入完成")
+
+        logs = mgr1.get_import_logs()
+        assert_true(len(logs) >= 1, "至少有 1 条导入日志")
+        last = logs[-1]
+        assert_eq(last.operator, "admin", "日志操作者 admin")
+        assert_eq(last.operator_role, UserRole.ADMIN, "日志角色 管理员")
+        assert_eq(last.file_format, "csv", "日志格式 csv")
+        assert_eq(last.total, 2, "日志总数 2")
+        assert_eq(last.success_count, sc, "日志成功数与返回一致")
+        assert_eq(last.fail_count, fc, "日志失败数与返回一致")
+        assert_true(len(last.fail_reasons) > 0, "失败原因列表非空")
+        assert_true(last.timestamp, "时间戳非空")
+
+        mgr2 = EquipmentManager()
+        mgr2.switch_user("admin")
+        logs2 = mgr2.get_import_logs()
+        assert_true(len(logs2) >= 1, "跨重启：日志依然存在")
+        assert_eq(logs2[-1].file_path, path_ok, "跨重启：日志文件路径一致")
+
+
 def main():
     setup_test_env()
     try:
@@ -563,6 +849,13 @@ def main():
         test_unwritable_dir_not_saved()
         test_valid_dir_still_works_after_failed_attempts()
         test_last_valid_dir_preserved_across_restart()
+        test_import_permission_denied_for_borrower()
+        test_import_admin_and_inspector_allowed()
+        test_import_precheck_detects_all_issues()
+        test_import_csv_and_json_success()
+        test_import_rollback_on_conflict()
+        test_import_config_persisted_across_restart()
+        test_import_log_generated()
     finally:
         cleanup_test_env()
 

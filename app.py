@@ -670,6 +670,8 @@ class App:
         self.btn_close_frozen.pack(side="left", padx=2)
         self.btn_history = ttk.Button(btns, text="查看历史", command=self._view_history)
         self.btn_history.pack(side="left", padx=2)
+        self.btn_import_records = ttk.Button(btns, text="批量导入", command=self._import_records)
+        self.btn_import_records.pack(side="right", padx=2)
         self.btn_export_records = ttk.Button(btns, text="导出选中", command=self._export_selected_records)
         self.btn_export_records.pack(side="right", padx=2)
 
@@ -800,6 +802,7 @@ class App:
             "unfreeze_device": [self.btn_unfreeze_device],
             "close_record": [self.btn_close_frozen],
             "export_data": [self.btn_export_devices, self.btn_export_records],
+            "import_records": [self.btn_import_records],
         }
         for perm, widgets in perm_map.items():
             enabled = self.manager.has_permission(perm)
@@ -1093,6 +1096,146 @@ class App:
             messagebox.showinfo("成功", msg)
         else:
             messagebox.showerror("失败", msg)
+
+    def _import_records(self):
+        if (self.manager.current_user and
+                self.manager.current_user.role == UserRole.BORROWER):
+            messagebox.showerror("无权限",
+                                 "借用人不能进行批量导入操作。\n"
+                                 "请联系管理员或验收人处理。")
+            return
+
+        initial = (self.manager.config.last_import_dir
+                   or self.manager.config.export_dir
+                   or os.path.expanduser("~"))
+        filepath = filedialog.askopenfilename(
+            title="选择要导入的借用记录文件",
+            initialdir=initial,
+            filetypes=[
+                ("CSV / JSON 数据文件", "*.csv *.json"),
+                ("CSV 表格", "*.csv"),
+                ("JSON 数据", "*.json"),
+                ("所有文件", "*.*"),
+            ]
+        )
+        if not filepath:
+            return
+
+        try:
+            ok, msg, summary = self.manager.precheck_import_file(filepath)
+        except BusinessError as e:
+            messagebox.showerror("错误", str(e))
+            return
+
+        if not ok:
+            messagebox.showerror("预检失败", f"文件无法解析：\n{msg}")
+            return
+
+        dlg = ImportPrecheckDialog(self.root, filepath, summary)
+        self.root.wait_window(dlg)
+        if not dlg.confirmed:
+            return
+
+        try:
+            ok, msg, sc, fc = self.manager.commit_import(filepath)
+        except BusinessError as e:
+            messagebox.showerror("错误", str(e))
+            return
+
+        self._refresh_devices()
+        self._refresh_records()
+        if ok:
+            messagebox.showinfo(
+                "导入完成",
+                f"{msg}\n\n"
+                f"文件：{os.path.basename(filepath)}\n"
+                f"总数：{summary.total}，成功：{sc}，失败：{fc}"
+            )
+            self.status_var.set(f"批量导入完成：成功 {sc}，失败 {fc}")
+        else:
+            messagebox.showerror(
+                "导入失败（已回滚）",
+                f"{msg}\n\n"
+                f"所有记录均未写入，设备状态和记录历史保持不变。"
+            )
+
+
+class ImportPrecheckDialog(tk.Toplevel):
+    def __init__(self, master, filepath: str, summary):
+        super().__init__(master)
+        self.title(f"导入预检 - {os.path.basename(filepath)}")
+        self.geometry("680x560")
+        self.minsize(600, 480)
+        self.summary = summary
+        self.confirmed = False
+        self._build(filepath)
+        self.grab_set()
+        self.transient(master)
+
+    def _build(self, filepath: str):
+        main = ttk.Frame(self, padding=12)
+        main.pack(fill="both", expand=True)
+
+        info = ttk.LabelFrame(main, text="预检概要", padding=8)
+        info.pack(fill="x", pady=(0, 8))
+        s = self.summary
+        ttk.Label(info, text=f"文件：{filepath}").grid(row=0, column=0, sticky="w", columnspan=4)
+        ttk.Label(info, text=f"记录总数：{s.total}").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Label(info, text=f"可导入：{s.importable}",
+                  foreground="#27ae60").grid(row=1, column=1, sticky="w", padx=20)
+        ttk.Label(info, text=f"字段缺失：{s.field_missing}",
+                  foreground="#c0392b").grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Label(info, text=f"设备不存在：{s.device_not_found}",
+                  foreground="#c0392b").grid(row=2, column=1, sticky="w", padx=20)
+        ttk.Label(info, text=f"设备状态冲突：{s.device_status_conflict}",
+                  foreground="#c0392b").grid(row=2, column=2, sticky="w", padx=20)
+        ttk.Label(info, text=f"借用人不存在：{s.borrower_not_found}",
+                  foreground="#c0392b").grid(row=3, column=0, sticky="w", pady=2)
+        ttk.Label(info, text=f"重复记录：{s.duplicate}",
+                  foreground="#c0392b").grid(row=3, column=1, sticky="w", padx=20)
+
+        tree_frame = ttk.LabelFrame(main, text="问题明细（如有）", padding=8)
+        tree_frame.pack(fill="both", expand=True)
+        cols = ("row", "kind", "device", "borrower", "detail")
+        tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=14)
+        tree.heading("row", text="行号")
+        tree.heading("kind", text="问题类型")
+        tree.heading("device", text="设备ID")
+        tree.heading("borrower", text="借用人ID")
+        tree.heading("detail", text="说明")
+        tree.column("row", width=60, anchor="center")
+        tree.column("kind", width=110, anchor="center")
+        tree.column("device", width=90, anchor="w")
+        tree.column("borrower", width=90, anchor="w")
+        tree.column("detail", width=300, anchor="w")
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        for iss in self.summary.issues:
+            tree.insert("", "end", values=(
+                iss.get("row", ""), iss.get("kind", ""),
+                iss.get("device_id", ""), iss.get("borrower_id", ""),
+                iss.get("detail", "")
+            ))
+
+        tip = ttk.Label(main,
+                        text="提示：点击【确认导入】将仅写入可导入记录；若中途出错，整批回滚。",
+                        foreground="#2980b9")
+        tip.pack(anchor="w", pady=(6, 0))
+
+        btns = ttk.Frame(main)
+        btns.pack(pady=(10, 0))
+        ok_btn = ttk.Button(btns, text="确认导入", command=self._ok)
+        if self.summary.importable == 0:
+            ok_btn.config(state="disabled")
+        ok_btn.pack(side="left", padx=6)
+        ttk.Button(btns, text="取消", command=self.destroy).pack(side="left", padx=6)
+
+    def _ok(self):
+        self.confirmed = True
+        self.destroy()
 
 
 def main():
