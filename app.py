@@ -20,6 +20,16 @@ STATUS_COLORS = {
     RecordStatus.FROZEN: "#c0392b",
 }
 
+ALERT_OVERDUE_COLOR = "#c0392b"
+ALERT_DUE_SOON_COLOR = "#f39c12"
+
+FILTER_LABELS = {
+    "all": "全部",
+    "due_soon": "临期",
+    "overdue": "逾期",
+    "returned": "已归还",
+}
+
 
 class AccessoryCheckFrame(ttk.LabelFrame):
     def __init__(self, master, accessories: List[Accessory],
@@ -530,6 +540,8 @@ class App:
         self.manager = EquipmentManager()
         self._selected_device_id: Optional[str] = None
         self._selected_record_id: Optional[str] = None
+        self._current_alert_filter: str = "all"
+        self._preserved_record_selection: List[str] = []
         self._build_ui()
         self._refresh_all()
 
@@ -658,6 +670,34 @@ class App:
         frame = ttk.LabelFrame(parent, text="借用记录", padding=6)
         frame.pack(fill="both", expand=True)
 
+        filter_frame = ttk.Frame(frame)
+        filter_frame.pack(fill="x", pady=(0, 4))
+
+        ttk.Label(filter_frame, text="筛选:").pack(side="left", padx=(0, 4))
+        self.filter_buttons = {}
+        for key in ("all", "due_soon", "overdue", "returned"):
+            btn = ttk.Button(filter_frame, text=FILTER_LABELS[key],
+                             command=lambda k=key: self._on_filter_changed(k))
+            btn.pack(side="left", padx=2)
+            self.filter_buttons[key] = btn
+
+        ttk.Separator(filter_frame, orient="vertical").pack(side="left", fill="y", padx=8)
+
+        ttk.Label(filter_frame, text="提醒天数:").pack(side="left", padx=(0, 4))
+        self.reminder_days_var = tk.StringVar(value=str(self.manager.get_reminder_days()))
+        self.reminder_days_entry = ttk.Spinbox(
+            filter_frame, from_=1, to=365, width=6,
+            textvariable=self.reminder_days_var, state="readonly"
+        )
+        self.reminder_days_entry.pack(side="left")
+        self.btn_set_reminder_days = ttk.Button(
+            filter_frame, text="应用", command=self._on_set_reminder_days
+        )
+        self.btn_set_reminder_days.pack(side="left", padx=(4, 8))
+
+        self.filter_status_label = ttk.Label(filter_frame, text="", foreground="#2980b9")
+        self.filter_status_label.pack(side="left")
+
         btns = ttk.Frame(frame)
         btns.pack(fill="x", pady=(0, 4))
         self.btn_borrow = ttk.Button(btns, text="借出登记", command=self._borrow_device)
@@ -678,7 +718,7 @@ class App:
         tree_frame = ttk.Frame(frame)
         tree_frame.pack(fill="both", expand=True)
         cols = ("id", "device", "borrower", "dept", "borrow_time",
-                "exp_return", "status", "operator")
+                "exp_return", "alert", "status", "operator")
         self.record_tree = ttk.Treeview(tree_frame, columns=cols,
                                         show="headings", selectmode="extended")
         self.record_tree.heading("id", text="记录ID")
@@ -687,15 +727,17 @@ class App:
         self.record_tree.heading("dept", text="部门")
         self.record_tree.heading("borrow_time", text="借出时间")
         self.record_tree.heading("exp_return", text="预计归还")
+        self.record_tree.heading("alert", text="提醒")
         self.record_tree.heading("status", text="状态")
         self.record_tree.heading("operator", text="借出操作员")
         self.record_tree.column("id", width=80, anchor="center")
-        self.record_tree.column("device", width=200, anchor="w")
+        self.record_tree.column("device", width=180, anchor="w")
         self.record_tree.column("borrower", width=80, anchor="w")
         self.record_tree.column("dept", width=100, anchor="w")
         self.record_tree.column("borrow_time", width=140, anchor="w")
         self.record_tree.column("exp_return", width=140, anchor="w")
-        self.record_tree.column("status", width=90, anchor="center")
+        self.record_tree.column("alert", width=70, anchor="center")
+        self.record_tree.column("status", width=80, anchor="center")
         self.record_tree.column("operator", width=90, anchor="w")
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.record_tree.yview)
         self.record_tree.configure(yscrollcommand=vsb.set)
@@ -706,6 +748,10 @@ class App:
         for s in (RecordStatus.BORROWED, RecordStatus.INSPECTING,
                   RecordStatus.RETURNED, RecordStatus.FROZEN):
             self.record_tree.tag_configure(s, foreground=STATUS_COLORS[s])
+        self.record_tree.tag_configure("overdue", foreground=ALERT_OVERDUE_COLOR,
+                                       background="#fdecea")
+        self.record_tree.tag_configure("due_soon", foreground=ALERT_DUE_SOON_COLOR,
+                                       background="#fef5e7")
 
     def _refresh_all(self):
         self._refresh_user_combo()
@@ -744,14 +790,74 @@ class App:
             ))
 
     def _refresh_records(self):
+        current_selection = list(self.record_tree.selection())
+        if current_selection:
+            self._preserved_record_selection = current_selection
         self.record_tree.delete(*self.record_tree.get_children())
-        records = self.manager.get_filtered_records()
-        for r in sorted(records, key=lambda x: x.borrow_time, reverse=True):
+        base_records = self.manager.get_filtered_records()
+        filtered_records = self.manager.filter_records_by_alert(
+            base_records, self._current_alert_filter
+        )
+        visible_ids = set()
+        for r in sorted(filtered_records, key=lambda x: x.borrow_time, reverse=True):
+            alert_status = self.manager.get_record_alert_status(r)
+            alert_text = ""
+            tags = [r.status]
+            if alert_status == "overdue":
+                alert_text = "⚠ 逾期"
+                tags.append("overdue")
+            elif alert_status == "due_soon":
+                alert_text = "⏰ 临期"
+                tags.append("due_soon")
             self.record_tree.insert("", "end", iid=r.id, values=(
                 r.id, r.device_name, r.borrower_name, r.borrower_department,
-                r.borrow_time, r.expected_return_time, r.status,
+                r.borrow_time, r.expected_return_time, alert_text, r.status,
                 r.check_out_operator
-            ), tags=(r.status,))
+            ), tags=tags)
+            visible_ids.add(r.id)
+        to_restore = [rid for rid in self._preserved_record_selection if rid in visible_ids]
+        if to_restore:
+            try:
+                self.record_tree.selection_set(to_restore)
+            except Exception:
+                pass
+        for key, btn in self.filter_buttons.items():
+            if key == self._current_alert_filter:
+                btn.config(state="disabled")
+            else:
+                btn.config(state="normal")
+        total_count = len(base_records)
+        filtered_count = len(filtered_records)
+        status_text = f"显示 {filtered_count}/{total_count} 条"
+        if self._current_alert_filter != "all":
+            status_text += f"（{FILTER_LABELS[self._current_alert_filter]}）"
+        if filtered_count == 0 and self._current_alert_filter != "all":
+            status_text += " - 该筛选下无记录"
+        self.filter_status_label.config(text=status_text)
+        self.reminder_days_var.set(str(self.manager.get_reminder_days()))
+
+    def _on_filter_changed(self, filter_key: str):
+        self._preserved_record_selection = list(self.record_tree.selection())
+        self._current_alert_filter = filter_key
+        self._refresh_records()
+
+    def _on_set_reminder_days(self):
+        try:
+            days = int(self.reminder_days_var.get())
+        except ValueError:
+            messagebox.showerror("错误", "提醒天数必须是整数")
+            return
+        try:
+            ok, msg = self.manager.set_reminder_days(days)
+        except BusinessError as e:
+            messagebox.showerror("错误", str(e))
+            return
+        if ok:
+            messagebox.showinfo("成功", msg)
+            self._refresh_records()
+        else:
+            messagebox.showerror("失败", msg)
+            self.reminder_days_var.set(str(self.manager.get_reminder_days()))
 
     def _refresh_device_detail(self):
         self.device_detail.config(state="normal")
@@ -803,11 +909,15 @@ class App:
             "close_record": [self.btn_close_frozen],
             "export_data": [self.btn_export_devices, self.btn_export_records],
             "import_records": [self.btn_import_records],
+            "set_reminder_days": [self.btn_set_reminder_days, self.reminder_days_entry],
         }
         for perm, widgets in perm_map.items():
             enabled = self.manager.has_permission(perm)
             for w in widgets:
-                w.config(state="normal" if enabled else "disabled")
+                if perm == "set_reminder_days" and isinstance(w, ttk.Spinbox):
+                    w.config(state="normal" if enabled else "disabled")
+                else:
+                    w.config(state="normal" if enabled else "disabled")
 
     def _on_user_changed(self, _event=None):
         value = self.user_var.get()
@@ -1069,13 +1179,27 @@ class App:
             messagebox.showerror("失败", msg)
 
     def _export_selected_records(self):
+        base_records = self.manager.get_filtered_records()
+        visible_records = self.manager.filter_records_by_alert(
+            base_records, self._current_alert_filter
+        )
+        visible_ids = {r.id for r in visible_records}
         sel = self.record_tree.selection()
-        if not sel:
-            messagebox.showinfo("提示", "请先选择要导出的借用记录（支持多选）")
+        sel_ids = [rid for rid in sel if rid in visible_ids]
+        if not sel_ids:
+            if not visible_records:
+                messagebox.showinfo("提示", "当前筛选结果为空，没有可导出的记录")
+            else:
+                messagebox.showinfo(
+                    "提示",
+                    f"请先在当前【{FILTER_LABELS[self._current_alert_filter]}】筛选下"
+                    f"选择要导出的借用记录（支持多选）\n\n"
+                    f"当前筛选共 {len(visible_records)} 条可见记录"
+                )
             return
         if not self._check_export_dir():
             return
-        default_name = f"借用记录_{_now_str().replace(':', '-').replace(' ', '_')}"
+        default_name = f"借用记录_{FILTER_LABELS[self._current_alert_filter]}_{_now_str().replace(':', '-').replace(' ', '_')}"
         filepath = filedialog.asksaveasfilename(
             title="导出选中记录",
             initialdir=self.manager.config.export_dir,
@@ -1091,9 +1215,30 @@ class App:
                                        f"导出目录: {self.manager.config.export_dir}\n"
                                        f"确定继续导出？"):
                 return
-        ok, msg = self.manager.export_selected_records(list(sel), filepath)
+        alert_status_map = {}
+        for r in self.manager.records:
+            st = self.manager.get_record_alert_status(r)
+            if st == "overdue":
+                alert_status_map[r.id] = "逾期"
+            elif st == "due_soon":
+                alert_status_map[r.id] = "临期"
+            else:
+                alert_status_map[r.id] = "正常"
+        filter_info = {
+            "description": FILTER_LABELS[self._current_alert_filter],
+            "筛选类型": FILTER_LABELS[self._current_alert_filter],
+            "提醒天数": f"{self.manager.get_reminder_days()} 天",
+            "导出时间": _now_str(),
+            "操作人": (f"{self.manager.current_user.display_name} ({self.manager.current_user.username})"
+                       if self.manager.current_user else "unknown"),
+            "角色": self.manager.current_user.role if self.manager.current_user else "unknown",
+            "可见记录数": len(visible_records),
+            "本次选中导出数": len(sel_ids),
+            "_alert_status": alert_status_map,
+        }
+        ok, msg = self.manager.export_selected_records(sel_ids, filepath, filter_info)
         if ok:
-            messagebox.showinfo("成功", msg)
+            messagebox.showinfo("成功", f"{msg}\n\n共导出 {len(sel_ids)} 条记录（{FILTER_LABELS[self._current_alert_filter]} 筛选）")
         else:
             messagebox.showerror("失败", msg)
 

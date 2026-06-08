@@ -120,21 +120,29 @@ def check_dir_writable(dir_path: str) -> tuple[bool, str]:
         return False, f"目录没有写入权限：{dir_path}（{e}）"
 
 
-def export_records_csv(records: List[BorrowRecord], filepath: str) -> bool:
+def export_records_csv(records: List[BorrowRecord], filepath: str,
+                       filter_info: Optional[dict] = None) -> bool:
     try:
         with open(filepath, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f)
+            if filter_info:
+                writer.writerow([f"# 导出筛选条件: {filter_info.get('description', '')}"])
+                for k, v in filter_info.items():
+                    if k != "description":
+                        writer.writerow([f"# {k}: {v}"])
             writer.writerow([
                 "记录ID", "设备ID", "设备名称", "借用人ID", "借用人",
                 "借用人部门", "借出时间", "预计归还时间", "实际归还时间",
-                "状态", "借出操作员", "归还操作员", "验收操作员",
+                "状态", "提醒状态", "借出操作员", "归还操作员", "验收操作员",
                 "关闭操作员", "验收备注", "备注"
             ])
             for r in records:
+                alert_status = filter_info.get("_alert_status", {}).get(r.id, "") if filter_info else ""
                 writer.writerow([
                     r.id, r.device_id, r.device_name, r.borrower_id,
                     r.borrower_name, r.borrower_department, r.borrow_time,
                     r.expected_return_time, r.actual_return_time, r.status,
+                    alert_status,
                     r.check_out_operator, r.check_in_operator,
                     r.inspect_operator, r.close_operator,
                     r.inspect_remark, r.remark
@@ -144,11 +152,19 @@ def export_records_csv(records: List[BorrowRecord], filepath: str) -> bool:
         return False
 
 
-def export_records_json(records: List[BorrowRecord], filepath: str) -> bool:
+def export_records_json(records: List[BorrowRecord], filepath: str,
+                        filter_info: Optional[dict] = None) -> bool:
     try:
         with open(filepath, "w", encoding="utf-8") as f:
-            json.dump([r.to_dict() for r in records], f,
-                      ensure_ascii=False, indent=2)
+            data = {
+                "export_time": _now_str(),
+                "records": [r.to_dict() for r in records],
+            }
+            if filter_info:
+                data["filter_info"] = dict(filter_info)
+                if "_alert_status" in data["filter_info"]:
+                    del data["filter_info"]["_alert_status"]
+            json.dump(data, f, ensure_ascii=False, indent=2)
         return True
     except (IOError, OSError):
         return False

@@ -1,5 +1,6 @@
 import os
 import copy
+from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, Dict, Any
 from models import (
     Device, Borrower, BorrowRecord, User, Accessory,
@@ -358,7 +359,8 @@ class EquipmentManager:
         return storage.check_dir_writable(self.config.export_dir)
 
     def export_selected_records(self, record_ids: List[str],
-                                filepath: str) -> Tuple[bool, str]:
+                                filepath: str,
+                                filter_info: Optional[dict] = None) -> Tuple[bool, str]:
         ok, reason = self.check_export_dir_detail()
         if not ok:
             return False, (
@@ -368,9 +370,9 @@ class EquipmentManager:
             )
         selected = [r for r in self.records if r.id in record_ids]
         if filepath.lower().endswith(".csv"):
-            ok = storage.export_records_csv(selected, filepath)
+            ok = storage.export_records_csv(selected, filepath, filter_info)
         else:
-            ok = storage.export_records_json(selected, filepath)
+            ok = storage.export_records_json(selected, filepath, filter_info)
         if not ok:
             return False, (
                 f"导出失败，目标文件无法写入：{filepath}\n"
@@ -406,6 +408,74 @@ class EquipmentManager:
                     if r.borrower_name == self.current_user.display_name
                     or r.borrower_id == self.current_user.username]
         return self.records
+
+    @staticmethod
+    def _parse_datetime(s: str) -> Optional[datetime]:
+        if not s:
+            return None
+        s = s.strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(s, fmt)
+            except ValueError:
+                continue
+        return None
+
+    def is_overdue(self, record: BorrowRecord) -> bool:
+        if record.status == RecordStatus.RETURNED:
+            return False
+        dt = self._parse_datetime(record.expected_return_time)
+        if not dt:
+            return False
+        return datetime.now() > dt
+
+    def is_due_soon(self, record: BorrowRecord, days: Optional[int] = None) -> bool:
+        if record.status == RecordStatus.RETURNED:
+            return False
+        if self.is_overdue(record):
+            return False
+        dt = self._parse_datetime(record.expected_return_time)
+        if not dt:
+            return False
+        threshold_days = days if days is not None else self.config.reminder_days
+        return datetime.now() <= dt <= datetime.now() + timedelta(days=threshold_days)
+
+    def get_record_alert_status(self, record: BorrowRecord) -> str:
+        if self.is_overdue(record):
+            return "overdue"
+        if self.is_due_soon(record):
+            return "due_soon"
+        return "normal"
+
+    def set_reminder_days(self, days: int) -> Tuple[bool, str]:
+        self._require_permission("set_reminder_days")
+        try:
+            days_int = int(days)
+        except (ValueError, TypeError):
+            return False, "提醒天数必须是正整数"
+        if days_int <= 0:
+            return False, "提醒天数必须大于 0"
+        if days_int > 365:
+            return False, "提醒天数不能超过 365 天"
+        self.config.reminder_days = days_int
+        self.save_all()
+        return True, f"提醒天数已设置为 {days_int} 天"
+
+    def get_reminder_days(self) -> int:
+        return self.config.reminder_days
+
+    def filter_records_by_alert(self,
+                                records: List[BorrowRecord],
+                                alert_filter: str) -> List[BorrowRecord]:
+        if alert_filter == "all":
+            return list(records)
+        elif alert_filter == "returned":
+            return [r for r in records if r.status == RecordStatus.RETURNED]
+        elif alert_filter == "overdue":
+            return [r for r in records if self.is_overdue(r)]
+        elif alert_filter == "due_soon":
+            return [r for r in records if self.is_due_soon(r)]
+        return list(records)
 
     def _make_row_issue(self, row: dict, kind: str, detail: str) -> dict:
         return {

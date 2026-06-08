@@ -2,11 +2,14 @@ import os
 import sys
 import shutil
 import tempfile
+import csv
+import json
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models import (
-    Device, Borrower, BorrowRecord, Accessory, User,
+    Device, Borrower, BorrowRecord, Accessory, User, AppConfig,
     DeviceStatus, RecordStatus, UserRole
 )
 from business import EquipmentManager, BusinessError
@@ -993,6 +996,349 @@ def test_import_rejects_mixed_json_no_side_effects():
                   "摘要中 borrower_not_found = 1")
 
 
+def test_reminder_days_permission():
+    print("\n=== 测试27: 提醒天数设置 - 角色权限 ===")
+    mgr = _fresh_manager()
+
+    mgr.switch_user("zhangsan")
+    assert_true(not mgr.has_permission("set_reminder_days"), "借用人无 set_reminder_days 权限")
+    def try_set_borrower():
+        mgr.set_reminder_days(5)
+    assert_raises(try_set_borrower, BusinessError, "借用人设置提醒天数抛出权限异常")
+
+    mgr.switch_user("admin")
+    assert_true(mgr.has_permission("set_reminder_days"), "管理员有 set_reminder_days 权限")
+    ok, msg = mgr.set_reminder_days(7)
+    assert_true(ok, f"管理员设置 7 天成功: {msg}")
+    assert_eq(mgr.get_reminder_days(), 7, "内存中提醒天数为 7")
+
+    mgr.switch_user("wangwu")
+    assert_true(mgr.has_permission("set_reminder_days"), "验收人有 set_reminder_days 权限")
+    ok, msg = mgr.set_reminder_days(10)
+    assert_true(ok, f"验收人设置 10 天成功: {msg}")
+    assert_eq(mgr.get_reminder_days(), 10, "内存中提醒天数为 10")
+
+
+def test_reminder_days_validation():
+    print("\n=== 测试28: 提醒天数设置 - 合法值校验 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+    default_days = mgr.get_reminder_days()
+
+    ok, msg = mgr.set_reminder_days(0)
+    assert_true(not ok, "0 天设置失败")
+    assert_true("大于 0" in msg, f"错误信息包含'大于 0'（实际: {msg}）")
+    assert_eq(mgr.get_reminder_days(), default_days, "失败时天数保持默认值")
+
+    ok, msg = mgr.set_reminder_days(-1)
+    assert_true(not ok, "负数天数设置失败")
+    assert_eq(mgr.get_reminder_days(), default_days, "失败时天数保持默认值")
+
+    ok, msg = mgr.set_reminder_days(400)
+    assert_true(not ok, "超过 365 天设置失败")
+    assert_true("不能超过 365" in msg, f"错误信息包含上限提示（实际: {msg}）")
+    assert_eq(mgr.get_reminder_days(), default_days, "失败时天数保持默认值")
+
+    ok, msg = mgr.set_reminder_days("abc")
+    assert_true(not ok, "非数字天数设置失败")
+    assert_eq(mgr.get_reminder_days(), default_days, "失败时天数保持默认值")
+
+    ok, msg = mgr.set_reminder_days(1)
+    assert_true(ok, "1 天设置成功")
+    assert_eq(mgr.get_reminder_days(), 1, "提醒天数为 1")
+
+    ok, msg = mgr.set_reminder_days(365)
+    assert_true(ok, "365 天设置成功")
+    assert_eq(mgr.get_reminder_days(), 365, "提醒天数为 365")
+
+
+def test_reminder_days_persistence_across_restart():
+    print("\n=== 测试29: 提醒天数 - 跨重启持久化 ===")
+    setup_test_env()
+    mgr1 = EquipmentManager()
+    mgr1.switch_user("admin")
+    assert_eq(mgr1.get_reminder_days(), 3, "默认提醒天数为 3")
+
+    ok, _ = mgr1.set_reminder_days(14)
+    assert_true(ok, "设置 14 天成功")
+    assert_eq(mgr1.config.reminder_days, 14, "内存 config 已更新")
+
+    mgr2 = EquipmentManager()
+    assert_eq(mgr2.config.reminder_days, 14, "跨重启: config.reminder_days 仍是 14")
+    assert_eq(mgr2.get_reminder_days(), 14, "跨重启: get_reminder_days() 返回 14")
+
+    mgr2.switch_user("admin")
+    ok, _ = mgr2.set_reminder_days(5)
+    assert_true(ok, "第二次修改为 5 天成功")
+
+    mgr3 = EquipmentManager()
+    assert_eq(mgr3.get_reminder_days(), 5, "跨重启: 再次修改后的值仍被保留")
+
+
+def test_overdue_and_due_soon_boundary():
+    print("\n=== 测试30: 临期/逾期 - 边界判断 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+    mgr.set_reminder_days(3)
+
+    now = datetime.now()
+
+    def _mk_record(expected_return_str, status=RecordStatus.BORROWED):
+        borrower = mgr.borrowers[0]
+        dev = mgr.devices[0]
+        return BorrowRecord(
+            device_id=dev.id, device_name=dev.name,
+            borrower_id=borrower.id, borrower_name=borrower.name,
+            expected_return_time=expected_return_str,
+            status=status,
+        )
+
+    r_returned = _mk_record((now - timedelta(days=10)).strftime("%Y-%m-%d %H:%M:%S"),
+                            status=RecordStatus.RETURNED)
+    assert_true(not mgr.is_overdue(r_returned), "已归还记录不算逾期")
+    assert_true(not mgr.is_due_soon(r_returned), "已归还记录不算临期")
+
+    r_no_exp = _mk_record("")
+    assert_true(not mgr.is_overdue(r_no_exp), "无预计归还时间不算逾期")
+    assert_true(not mgr.is_due_soon(r_no_exp), "无预计归还时间不算临期")
+
+    r_overdue_1d = _mk_record((now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"))
+    assert_true(mgr.is_overdue(r_overdue_1d), "超过 1 天 -> 逾期")
+    assert_true(not mgr.is_due_soon(r_overdue_1d), "逾期不算临期")
+    assert_eq(mgr.get_record_alert_status(r_overdue_1d), "overdue",
+              "状态应为 overdue")
+
+    r_due_1min = _mk_record((now + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S"))
+    assert_true(not mgr.is_overdue(r_due_1min), "1 分钟后不算逾期")
+    assert_true(mgr.is_due_soon(r_due_1min), "1 分钟后（<=3天）算临期")
+    assert_eq(mgr.get_record_alert_status(r_due_1min), "due_soon",
+              "状态应为 due_soon")
+
+    r_due_2d = _mk_record((now + timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S"))
+    assert_true(not mgr.is_overdue(r_due_2d), "2 天后不算逾期")
+    assert_true(mgr.is_due_soon(r_due_2d), "2 天后（<=3天）算临期")
+
+    r_due_3d = _mk_record((now + timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S"))
+    assert_true(mgr.is_due_soon(r_due_3d), "3 天后（刚好阈值）算临期")
+
+    r_due_4d = _mk_record((now + timedelta(days=4)).strftime("%Y-%m-%d %H:%M:%S"))
+    assert_true(not mgr.is_overdue(r_due_4d), "4 天后不算逾期")
+    assert_true(not mgr.is_due_soon(r_due_4d), "4 天后（>3天）不算临期")
+    assert_eq(mgr.get_record_alert_status(r_due_4d), "normal",
+              "状态应为 normal")
+
+    r_due_2d_custom = _mk_record((now + timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S"))
+    assert_true(mgr.is_due_soon(r_due_2d_custom, days=3),
+                "指定 days=3: 2 天后算临期")
+    assert_true(not mgr.is_due_soon(r_due_2d_custom, days=1),
+                "指定 days=1: 2 天后不算临期")
+    r_due_05d = _mk_record((now + timedelta(hours=12)).strftime("%Y-%m-%d %H:%M:%S"))
+    assert_true(mgr.is_due_soon(r_due_05d, days=1), "指定 days=1: 0.5 天后算临期")
+
+
+def test_filter_records_by_alert():
+    print("\n=== 测试31: 筛选功能 - 按临期/逾期/已归还/全部过滤 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+    mgr.set_reminder_days(3)
+
+    now = datetime.now()
+    borrower = mgr.borrowers[0]
+    dev = mgr.devices[0]
+
+    test_records = {
+        "overdue": BorrowRecord(
+            id="ov01", device_id=dev.id, device_name=dev.name,
+            borrower_id=borrower.id, borrower_name=borrower.name,
+            expected_return_time=(now - timedelta(days=5)).strftime("%Y-%m-%d %H:%M:%S"),
+            status=RecordStatus.BORROWED,
+        ),
+        "due_soon": BorrowRecord(
+            id="ds01", device_id=dev.id, device_name=dev.name,
+            borrower_id=borrower.id, borrower_name=borrower.name,
+            expected_return_time=(now + timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S"),
+            status=RecordStatus.BORROWED,
+        ),
+        "returned": BorrowRecord(
+            id="rt01", device_id=dev.id, device_name=dev.name,
+            borrower_id=borrower.id, borrower_name=borrower.name,
+            expected_return_time=(now - timedelta(days=10)).strftime("%Y-%m-%d %H:%M:%S"),
+            status=RecordStatus.RETURNED,
+        ),
+        "normal": BorrowRecord(
+            id="nr01", device_id=dev.id, device_name=dev.name,
+            borrower_id=borrower.id, borrower_name=borrower.name,
+            expected_return_time=(now + timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S"),
+            status=RecordStatus.BORROWED,
+        ),
+    }
+
+    all_list = list(test_records.values())
+
+    all_filtered = mgr.filter_records_by_alert(all_list, "all")
+    assert_eq(len(all_filtered), 4, "all 筛选返回全部 4 条")
+
+    overdue_filtered = mgr.filter_records_by_alert(all_list, "overdue")
+    assert_eq(len(overdue_filtered), 1, "overdue 筛选返回 1 条")
+    assert_eq(overdue_filtered[0].id, "ov01", "逾期记录 ID 正确")
+
+    due_soon_filtered = mgr.filter_records_by_alert(all_list, "due_soon")
+    assert_eq(len(due_soon_filtered), 1, "due_soon 筛选返回 1 条")
+    assert_eq(due_soon_filtered[0].id, "ds01", "临期记录 ID 正确")
+
+    returned_filtered = mgr.filter_records_by_alert(all_list, "returned")
+    assert_eq(len(returned_filtered), 1, "returned 筛选返回 1 条")
+    assert_eq(returned_filtered[0].id, "rt01", "已归还记录 ID 正确")
+
+    empty_filtered = mgr.filter_records_by_alert([], "all")
+    assert_eq(len(empty_filtered), 0, "空列表筛选返回空")
+    empty_overdue = mgr.filter_records_by_alert([test_records["normal"]], "overdue")
+    assert_eq(len(empty_overdue), 0, "无逾期记录时 overdue 筛选返回空")
+
+
+def test_borrower_view_filter_with_alert():
+    print("\n=== 测试32: 借用人视角筛选 - 只能看到自己的记录 ===")
+    mgr = _fresh_manager()
+
+    mgr.switch_user("admin")
+    mgr.set_reminder_days(3)
+    now = datetime.now()
+    zhangsan = next(b for b in mgr.borrowers if b.name == "张三")
+    lisi = next(b for b in mgr.borrowers if b.name == "李四")
+
+    existing_for_zhangsan = [r for r in mgr.records
+                             if r.borrower_id == zhangsan.id or r.borrower_name == zhangsan.name]
+    for r in existing_for_zhangsan:
+        if r.status in (RecordStatus.BORROWED, RecordStatus.INSPECTING):
+            try:
+                mgr.submit_return(r.id, accessories=r.accessories_check_out, remark="测试先归还")
+                mgr.inspect_return(r.id, accessories=r.accessories_check_out,
+                                   inspect_remark="测试先验收")
+            except Exception:
+                pass
+
+    avail_dev = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+    r_zhangsan_overdue = mgr.borrow_device(
+        device_id=avail_dev.id,
+        borrower_id=zhangsan.id,
+        expected_return_time=(now - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S"),
+        remark="张三逾期测试",
+    )
+
+    avail_dev2 = next(d for d in mgr.devices
+                      if d.status == DeviceStatus.AVAILABLE and d.id != avail_dev.id)
+    r_lisi_normal = mgr.borrow_device(
+        device_id=avail_dev2.id,
+        borrower_id=lisi.id,
+        expected_return_time=(now + timedelta(days=10)).strftime("%Y-%m-%d %H:%M:%S"),
+        remark="李四正常测试",
+    )
+
+    mgr.switch_user("zhangsan")
+    all_for_zhangsan = mgr.get_filtered_records()
+    for r in all_for_zhangsan:
+        assert_true(r.borrower_name == "张三" or r.borrower_id == "zhangsan",
+                    f"借用人视角只看到自己的记录: {r.borrower_name}")
+    overdue_for_zhangsan = mgr.filter_records_by_alert(all_for_zhangsan, "overdue")
+    assert_true(any(r.id == r_zhangsan_overdue.id for r in overdue_for_zhangsan),
+                "张三视角能看到自己的那条逾期测试记录")
+
+    mgr.switch_user("lisi")
+    all_for_lisi = mgr.get_filtered_records()
+    for r in all_for_lisi:
+        assert_true(r.borrower_name == "李四" or r.borrower_id == "lisi",
+                    f"李四视角只看到自己的记录: {r.borrower_name}")
+    overdue_for_lisi = mgr.filter_records_by_alert(all_for_lisi, "overdue")
+    assert_eq(len(overdue_for_lisi), 0, "李四视角无逾期记录")
+
+    mgr.switch_user("admin")
+    all_for_admin = mgr.get_filtered_records()
+    assert_true(any(r.id == r_zhangsan_overdue.id for r in all_for_admin),
+                "管理员能看到张三的逾期记录")
+    assert_true(any(r.id == r_lisi_normal.id for r in all_for_admin),
+                "管理员能看到李四的正常记录")
+
+
+def test_export_with_filter_info():
+    print("\n=== 测试33: 导出选中记录 - 包含筛选条件 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr.set_export_dir(tmpdir)
+
+        r = mgr.records[0]
+        filter_info = {
+            "description": "逾期",
+            "筛选类型": "逾期",
+            "提醒天数": "3 天",
+            "可见记录数": 1,
+            "本次选中导出数": 1,
+        }
+
+        csv_path = os.path.join(tmpdir, "records_overdue.csv")
+        ok, msg = mgr.export_selected_records([r.id], csv_path, filter_info)
+        assert_true(ok, f"CSV 导出（含筛选条件）成功: {msg}")
+        assert_true(os.path.exists(csv_path) and os.path.getsize(csv_path) > 0,
+                    "CSV 文件存在且非空")
+        with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            lines = list(reader)
+        has_filter_meta = any("# 导出筛选条件" in str(cell) for row in lines for cell in row)
+        assert_true(has_filter_meta, "CSV 包含筛选条件元数据（# 开头行）")
+        has_alert_col = any("提醒状态" in str(cell) for row in lines for cell in row)
+        assert_true(has_alert_col, "CSV 包含'提醒状态'列")
+
+        json_path = os.path.join(tmpdir, "records_overdue.json")
+        ok, msg = mgr.export_selected_records([r.id], json_path, filter_info)
+        assert_true(ok, f"JSON 导出（含筛选条件）成功: {msg}")
+        assert_true(os.path.exists(json_path) and os.path.getsize(json_path) > 0,
+                    "JSON 文件存在且非空")
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        assert_true("filter_info" in data, "JSON 顶层包含 filter_info 字段")
+        assert_eq(data["filter_info"]["筛选类型"], "逾期",
+                  "JSON filter_info 中记录了筛选类型")
+        assert_eq(data["filter_info"]["提醒天数"], "3 天",
+                  "JSON filter_info 中记录了提醒天数")
+        assert_true("records" in data, "JSON 顶层包含 records 数组")
+        assert_true(len(data["records"]) >= 1, "JSON records 数组非空")
+        assert_true("export_time" in data, "JSON 顶层包含 export_time")
+
+
+def test_export_filter_info_empty_scenario():
+    print("\n=== 测试34: 空结果场景 - 无选中/无记录时提示 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+
+    assert_eq(mgr.config.reminder_days, 3, "默认 reminder_days 为 3")
+
+    setup_test_env()
+    mgr_empty = EquipmentManager()
+    mgr_empty.switch_user("admin")
+    mgr_empty.records = []
+    mgr_empty.save_all()
+
+    mgr_empty2 = EquipmentManager()
+    mgr_empty2.switch_user("admin")
+    base = mgr_empty2.get_filtered_records()
+    filtered = mgr_empty2.filter_records_by_alert(base, "overdue")
+    assert_eq(len(filtered), 0, "空记录库 overdue 筛选返回 0 条")
+    filtered_all = mgr_empty2.filter_records_by_alert(base, "all")
+    assert_eq(len(filtered_all), 0, "空记录库 all 筛选返回 0 条")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr_empty2.set_export_dir(tmpdir)
+        csv_path = os.path.join(tmpdir, "empty.csv")
+        ok, msg = mgr_empty2.export_selected_records([], csv_path,
+                                                     {"筛选类型": "逾期", "提醒天数": "3 天"})
+        assert_true(ok, "空记录导出仍成功（只要路径可写）")
+        with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            lines = list(reader)
+        has_header = any("记录ID" in str(cell) for row in lines for cell in row)
+        assert_true(has_header, "空结果 CSV 仍包含表头")
+
+
 def main():
     setup_test_env()
     try:
@@ -1022,6 +1368,14 @@ def main():
         test_import_log_generated()
         test_import_rejects_mixed_csv_no_side_effects()
         test_import_rejects_mixed_json_no_side_effects()
+        test_reminder_days_permission()
+        test_reminder_days_validation()
+        test_reminder_days_persistence_across_restart()
+        test_overdue_and_due_soon_boundary()
+        test_filter_records_by_alert()
+        test_borrower_view_filter_with_alert()
+        test_export_with_filter_info()
+        test_export_filter_info_empty_scenario()
     finally:
         cleanup_test_env()
 

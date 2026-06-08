@@ -38,10 +38,12 @@ class UserRole:
         ADMIN: ["add_device", "edit_device", "delete_device",
                 "add_borrower", "borrow_device", "return_device",
                 "inspect_return", "freeze_device", "unfreeze_device",
-                "close_record", "export_data", "import_records", "view_all"],
+                "close_record", "export_data", "import_records", "view_all",
+                "set_reminder_days"],
         BORROWER: ["borrow_device", "view_own", "export_data"],
         INSPECTOR: ["inspect_return", "return_device", "close_record",
-                    "view_all", "export_data", "import_records"],
+                    "view_all", "export_data", "import_records",
+                    "set_reminder_days"],
     }
 
     @classmethod
@@ -230,6 +232,7 @@ class AppConfig:
     last_import_dir: str = ""
     last_import_format: str = ""
     last_import_summary: dict = field(default_factory=dict)
+    reminder_days: int = 3
 
     def to_dict(self):
         return asdict(self)
