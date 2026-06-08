@@ -11,7 +11,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from models import (
     Device, Borrower, BorrowRecord, Accessory, User, AppConfig,
     DeviceStatus, RecordStatus, UserRole, MaintenanceRecord,
-    InventorySession, InventoryItem, InventoryStatus, InventoryItemResult
+    InventorySession, InventoryItem, InventoryStatus, InventoryItemResult,
+    HandoffRecord, HandoffAction, HandoffStatus
 )
 from business import EquipmentManager, BusinessError
 import storage
@@ -33,6 +34,7 @@ def setup_test_env():
     storage.IMPORT_LOGS_FILE = os.path.join(TEST_DATA_DIR, "import_logs.json")
     storage.MAINTENANCE_LOGS_FILE = os.path.join(TEST_DATA_DIR, "maintenance_logs.json")
     storage.INVENTORY_FILE = os.path.join(TEST_DATA_DIR, "inventory_sessions.json")
+    storage.HANDOFF_DB_FILE = os.path.join(TEST_DATA_DIR, "handover_records.db")
 
 
 def cleanup_test_env():
@@ -2094,6 +2096,401 @@ def test_inventory_create_with_filter_and_device_ids():
         assert_true(True, "空筛选结果正确抛出异常")
 
 
+def test_handoff_permission_roles():
+    print("\n=== 测试52: 交接复核 - 角色权限 ===")
+    mgr = _fresh_manager()
+
+    mgr.switch_user("zhangsan")
+    assert_true(not mgr.has_permission("create_handoff"),
+                "借用人无 create_handoff 权限")
+    assert_true(not mgr.has_permission("edit_handoff"),
+                "借用人无 edit_handoff 权限")
+    assert_true(not mgr.has_permission("complete_handoff"),
+                "借用人无 complete_handoff 权限")
+    assert_true(not mgr.has_permission("view_handoff_all"),
+                "借用人无 view_handoff_all 权限")
+    assert_true(not mgr.has_permission("export_handoff"),
+                "借用人无 export_handoff 权限")
+    assert_true(mgr.has_permission("view_own_handoff"),
+                "借用人有 view_own_handoff 权限")
+    assert_true(mgr.has_permission("confirm_handoff"),
+                "借用人有 confirm_handoff 权限")
+    assert_true(mgr.has_permission("object_handoff"),
+                "借用人有 object_handoff 权限")
+
+    mgr.switch_user("wangwu")
+    assert_true(not mgr.has_permission("create_handoff"),
+                "验收人无 create_handoff 权限")
+    assert_true(not mgr.has_permission("edit_handoff"),
+                "验收人无 edit_handoff 权限")
+    assert_true(not mgr.has_permission("complete_handoff"),
+                "验收人无 complete_handoff 权限")
+    assert_true(mgr.has_permission("view_handoff_all"),
+                "验收人有 view_handoff_all 权限")
+    assert_true(mgr.has_permission("export_handoff"),
+                "验收人有 export_handoff 权限")
+
+    mgr.switch_user("admin")
+    assert_true(mgr.has_permission("create_handoff"),
+                "管理员有 create_handoff 权限")
+    assert_true(mgr.has_permission("edit_handoff"),
+                "管理员有 edit_handoff 权限")
+    assert_true(mgr.has_permission("complete_handoff"),
+                "管理员有 complete_handoff 权限")
+    assert_true(mgr.has_permission("view_handoff_all"),
+                "管理员有 view_handoff_all 权限")
+    assert_true(mgr.has_permission("export_handoff"),
+                "管理员有 export_handoff 权限")
+
+    mgr.switch_user("zhangsan")
+    avail = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+    assert_raises(lambda: mgr.create_handoff(avail.id, HandoffAction.BORROW_OUT),
+                  BusinessError, "借用人调用 create_handoff 抛出权限异常")
+
+    mgr.switch_user("admin")
+    avail2 = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+    zhangsan = next(b for b in mgr.borrowers if b.name == "张三")
+    rec = mgr.borrow_device(avail2.id, zhangsan.id,
+                            (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S"),
+                            [], "交接权限测试")
+    handoff = mgr.create_handoff(avail2.id, HandoffAction.RETURN_BACK,
+                                  source_record_id=rec.id, admin_remark="测试交接")
+    mgr.switch_user("lisi")
+    assert_raises(lambda: mgr.confirm_handoff_as_borrower(handoff.id, "确认"),
+                  BusinessError, "非相关借用人确认时（无权限或非本人）也受权限约束")
+
+
+def test_handoff_restart_persistence():
+    print("\n=== 测试53: 交接复核 - 跨重启持久化（草稿备注+状态+筛选条件） ===")
+    setup_test_env()
+    mgr1 = EquipmentManager()
+    mgr1.switch_user("admin")
+
+    avail = next(d for d in mgr1.devices if d.status == DeviceStatus.AVAILABLE)
+    zhangsan = next(b for b in mgr1.borrowers if b.name == "张三")
+    rec = mgr1.borrow_device(avail.id, zhangsan.id,
+                             (datetime.now() + timedelta(days=5)).strftime("%Y-%m-%d %H:%M:%S"),
+                             [], "持久化测试借用")
+    handoff = mgr1.create_handoff(avail.id, HandoffAction.RETURN_BACK,
+                                   source_record_id=rec.id,
+                                   admin_remark="管理员备注A",
+                                   draft_remark="草稿备注A")
+    handoff_id = handoff.id
+    assert_eq(handoff.status, HandoffStatus.PENDING, "初始状态为待确认")
+
+    mgr1.update_handoff_draft(handoff_id, draft_remark="更新后的草稿备注B",
+                               admin_remark="更新后的管理员备注B")
+    flt = {"device_id": avail.id, "current_holder": "张三",
+           "business_status": "all", "status_filter": "all", "action_type": "all"}
+    mgr1.save_handoff_filter(flt)
+
+    mgr2 = EquipmentManager()
+    mgr2.switch_user("admin")
+    handoff2 = mgr2.find_handoff(handoff_id)
+    assert_true(handoff2 is not None, "跨重启：交接记录存在")
+    assert_eq(handoff2.status, HandoffStatus.PENDING, "跨重启：状态持久化正确")
+    assert_eq(handoff2.draft_remark, "更新后的草稿备注B",
+              "跨重启：草稿备注持久化正确")
+    assert_eq(handoff2.admin_remark, "更新后的管理员备注B",
+              "跨重启：管理员备注持久化正确")
+
+    saved_flt = mgr2.get_last_handoff_filter()
+    assert_eq(saved_flt.get("device_id"), avail.id,
+              "跨重启：筛选条件 device_id 保留")
+    assert_eq(saved_flt.get("current_holder"), "张三",
+              "跨重启：筛选条件 current_holder 保留")
+
+    mgr2.switch_user("zhangsan")
+    handoff3 = mgr2.confirm_handoff_as_borrower(handoff_id, "借用人确认收到")
+    assert_true(handoff3.borrower_confirm, "借用人确认后 borrower_confirm=True")
+    assert_eq(handoff3.borrower_remark, "借用人确认收到",
+              "借用人确认备注已记录")
+
+    mgr3 = EquipmentManager()
+    mgr3.switch_user("admin")
+    handoff4 = mgr3.find_handoff(handoff_id)
+    assert_true(handoff4.borrower_confirm, "跨重启：借用人确认状态保留")
+    assert_eq(handoff4.borrower_remark, "借用人确认收到",
+              "跨重启：借用人确认备注保留")
+
+    handoff5 = mgr3.complete_handoff(handoff_id, final_conclusion="交接完成，一切正常")
+    assert_eq(handoff5.status, HandoffStatus.COMPLETED, "完成后状态为已完成")
+    assert_eq(handoff5.final_conclusion, "交接完成，一切正常",
+              "最终结论已记录")
+    assert_true(handoff5.completed_at, "完成时间非空")
+    assert_eq(handoff5.completed_by, "admin", "完成操作人正确")
+
+    mgr4 = EquipmentManager()
+    mgr4.switch_user("admin")
+    handoff6 = mgr4.find_handoff(handoff_id)
+    assert_eq(handoff6.status, HandoffStatus.COMPLETED,
+              "跨重启：已完成状态保留")
+    assert_eq(handoff6.final_conclusion, "交接完成，一切正常",
+              "跨重启：最终结论保留")
+
+
+def test_handoff_status_conflict_all_actions():
+    print("\n=== 测试54: 交接复核 - 4 类动作状态冲突校验（不静默覆盖） ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+
+    avail = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+    borrowed = next(d for d in mgr.devices if d.status == DeviceStatus.BORROWED)
+    frozen = next(d for d in mgr.devices if d.status == DeviceStatus.FROZEN)
+
+    avail_status_before = avail.status
+    borrowed_status_before = borrowed.status
+    frozen_status_before = frozen.status
+
+    def try_borrow_out_on_borrowed():
+        mgr.create_handoff(borrowed.id, HandoffAction.BORROW_OUT)
+    assert_raises(try_borrow_out_on_borrowed, BusinessError,
+                  "已借出设备发起借出交接抛出异常")
+    assert_eq(borrowed.status, borrowed_status_before,
+              "冲突后设备状态保持不变（已借出）")
+
+    mgr.send_to_maintenance(avail.id, "测试维修", "")
+    maint_dev = avail
+    maint_status_before = maint_dev.status
+
+    def try_borrow_out_on_maint():
+        mgr.create_handoff(maint_dev.id, HandoffAction.BORROW_OUT)
+    assert_raises(try_borrow_out_on_maint, BusinessError,
+                  "维修中设备发起借出交接抛出异常")
+    assert_eq(maint_dev.status, maint_status_before,
+              "冲突后设备状态保持不变（维修中）")
+
+    def try_borrow_out_on_frozen():
+        mgr.create_handoff(frozen.id, HandoffAction.BORROW_OUT)
+    assert_raises(try_borrow_out_on_frozen, BusinessError,
+                  "冻结设备发起借出交接抛出异常")
+    assert_eq(frozen.status, frozen_status_before,
+              "冲突后设备状态保持不变（冻结）")
+
+    def try_return_on_avail_like():
+        new_avail = Device(name="临时可借出设备", status=DeviceStatus.AVAILABLE)
+        mgr.devices.append(new_avail)
+        mgr.save_all()
+        mgr.create_handoff(new_avail.id, HandoffAction.RETURN_BACK)
+    assert_raises(try_return_on_avail_like, BusinessError,
+                  "可借出设备发起归还交接抛出异常")
+
+    def try_maint_back_on_not_maint():
+        mgr.create_handoff(frozen.id, HandoffAction.MAINTENANCE_BACK)
+    assert_raises(try_maint_back_on_not_maint, BusinessError,
+                  "非维修中设备发起维修后交回抛出异常")
+    assert_eq(frozen.status, frozen_status_before,
+              "冲突后冻结设备状态保持不变")
+
+    def try_freeze_release_on_not_frozen():
+        mgr.create_handoff(borrowed.id, HandoffAction.FREEZE_RELEASE)
+    assert_raises(try_freeze_release_on_not_frozen, BusinessError,
+                  "非冻结设备发起冻结解除抛出异常")
+    assert_eq(borrowed.status, borrowed_status_before,
+              "冲突后已借出设备状态保持不变")
+
+    zhangsan = next(b for b in mgr.borrowers if b.name == "张三")
+    ok_rec = mgr.borrow_device(
+        next(d for d in mgr.devices
+             if d.status == DeviceStatus.AVAILABLE and d.id != maint_dev.id).id,
+        zhangsan.id,
+        (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S"),
+        [], "合法归还交接测试"
+    )
+    ok_dev = mgr.find_device(ok_rec.device_id)
+    ok_dev_status_before = ok_dev.status
+    ok_handoff = mgr.create_handoff(ok_dev.id, HandoffAction.RETURN_BACK,
+                                     source_record_id=ok_rec.id)
+    assert_eq(ok_dev.status, ok_dev_status_before,
+              "合法创建交接不会改变设备状态")
+    assert_eq(ok_handoff.device_id, ok_dev.id, "合法交接关联正确设备")
+    assert_eq(ok_handoff.action_type, HandoffAction.RETURN_BACK,
+              "交接动作类型正确")
+
+    conflict_avail = next(d for d in mgr.devices
+                          if d.status == DeviceStatus.AVAILABLE
+                          and d.id != maint_dev.id and d.id != ok_dev.id)
+    mgr.send_to_maintenance(conflict_avail.id, "制造一台维修中设备做冲突测试", "")
+    maint_for_conflict = conflict_avail
+
+    def try_complete_with_conflict():
+        mgr2 = EquipmentManager()
+        mgr2.switch_user("admin")
+        conflict_handoff = mgr2.create_handoff(
+            maint_for_conflict.id, HandoffAction.MAINTENANCE_BACK,
+            admin_remark="先创建一个合法的维修后交回交接"
+        )
+        mgr2.cancel_last_maintenance(maint_for_conflict.id, "撤销维修，制造状态冲突")
+        mgr2.complete_handoff(conflict_handoff.id, "尝试完成")
+    assert_raises(try_complete_with_conflict, BusinessError,
+                  "完成交接时若设备状态已变化也抛出冲突")
+
+
+def test_handoff_borrower_objection_and_view_own():
+    print("\n=== 测试55: 交接复核 - 借用人异议 + 只能看自己相关记录 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+
+    zhangsan = next(b for b in mgr.borrowers if b.name == "张三")
+    lisi = next(b for b in mgr.borrowers if b.name == "李四")
+
+    avail1 = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+    rec1 = mgr.borrow_device(avail1.id, zhangsan.id,
+                             (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S"),
+                             [], "张三借用-异议测试")
+    h_zhangsan = mgr.create_handoff(avail1.id, HandoffAction.RETURN_BACK,
+                                     source_record_id=rec1.id,
+                                     admin_remark="张三的交接")
+
+    avail2 = next(d for d in mgr.devices
+                  if d.status == DeviceStatus.AVAILABLE and d.id != avail1.id)
+    rec2 = mgr.borrow_device(avail2.id, lisi.id,
+                             (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S"),
+                             [], "李四借用-隔离测试")
+    h_lisi = mgr.create_handoff(avail2.id, HandoffAction.RETURN_BACK,
+                                 source_record_id=rec2.id,
+                                 admin_remark="李四的交接")
+
+    mgr.switch_user("zhangsan")
+    visible = mgr.get_handoff_records()
+    ids_visible = {h.id for h in visible}
+    assert_true(h_zhangsan.id in ids_visible, "张三能看到自己的交接记录")
+    assert_true(h_lisi.id not in ids_visible, "张三看不到李四的交接记录")
+
+    h_obj = mgr.object_handoff_as_borrower(h_zhangsan.id,
+                                            reason="设备有划痕未在借出时注明",
+                                            remark="我不接受当前状态")
+    assert_eq(h_obj.status, HandoffStatus.OBJECTED, "异议后状态变为有异议")
+    assert_eq(h_obj.objection_reason, "设备有划痕未在借出时注明",
+              "异议原因已记录")
+    assert_true(not h_obj.borrower_confirm, "异议后 borrower_confirm=False")
+
+    mgr2 = EquipmentManager()
+    mgr2.switch_user("zhangsan")
+    h_obj2 = mgr2.find_handoff(h_zhangsan.id)
+    assert_eq(h_obj2.status, HandoffStatus.OBJECTED,
+              "跨重启：异议状态保留")
+    assert_eq(h_obj2.objection_reason, "设备有划痕未在借出时注明",
+              "跨重启：异议原因保留")
+
+    mgr2.switch_user("lisi")
+    visible_lisi = mgr2.get_handoff_records()
+    ids_lisi = {h.id for h in visible_lisi}
+    assert_true(h_lisi.id in ids_lisi, "李四能看到自己的交接")
+    assert_true(h_zhangsan.id not in ids_lisi, "李四看不到张三有异议的交接")
+
+
+def test_handoff_export_fields_csv_and_json():
+    print("\n=== 测试56: 交接复核 - CSV/JSON 导出（含筛选条件、处理人、确认时间、异议原因、最终结论） ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+
+    zhangsan = next(b for b in mgr.borrowers if b.name == "张三")
+    avail = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+    rec = mgr.borrow_device(avail.id, zhangsan.id,
+                            (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S"),
+                            [], "导出测试借用")
+    handoff = mgr.create_handoff(avail.id, HandoffAction.RETURN_BACK,
+                                  source_record_id=rec.id,
+                                  admin_remark="导出测试交接")
+    mgr.switch_user("zhangsan")
+    mgr.confirm_handoff_as_borrower(handoff.id, "借用人确认无误")
+    mgr.switch_user("admin")
+    handoff_done = mgr.complete_handoff(handoff.id,
+                                         final_conclusion="交接完成，测试导出")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ok, _ = mgr.set_export_dir(tmpdir)
+        assert_true(ok, "导出目录设置成功")
+        filter_info = {
+            "description": "已完成交接记录",
+            "设备": avail.id,
+            "当前持有人": "张三",
+            "业务状态": "all",
+            "交接状态": HandoffStatus.COMPLETED,
+            "交接动作": HandoffAction.RETURN_BACK,
+            "本次选中导出数": 1,
+        }
+
+        csv_path = os.path.join(tmpdir, "handoff_done.csv")
+        ok, msg = mgr.export_handoff_records([handoff_done.id], csv_path, filter_info)
+        assert_true(ok, f"CSV 导出成功: {msg}")
+        assert_true(os.path.exists(csv_path) and os.path.getsize(csv_path) > 0,
+                    "CSV 文件存在且非空")
+        with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            csv_lines = list(reader)
+        csv_flat = " ".join(str(cell) for row in csv_lines for cell in row)
+        for kw in ["筛选条件", "导出操作人", "确认时间", "异议原因", "最终结论",
+                   "交接记录ID", "借用人确认", "交接状态"]:
+            assert_true(kw in csv_flat, f"CSV 包含关键字段：{kw}")
+        assert_true("admin" in csv_flat, "CSV 包含处理人 admin")
+
+        json_path = os.path.join(tmpdir, "handoff_done.json")
+        ok, msg = mgr.export_handoff_records([handoff_done.id], json_path, filter_info)
+        assert_true(ok, f"JSON 导出成功: {msg}")
+        assert_true(os.path.exists(json_path) and os.path.getsize(json_path) > 0,
+                    "JSON 文件存在且非空")
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        assert_true("filter_info" in data, "JSON 顶层含 filter_info")
+        assert_true("export_operator" in data, "JSON 顶层含 export_operator（处理人）")
+        assert_eq(data["export_operator"], "admin", "处理人为 admin")
+        assert_true("export_time" in data, "JSON 顶层含 export_time（确认/导出时间）")
+        assert_true("records" in data, "JSON 顶层含 records 数组")
+        assert_true(len(data["records"]) >= 1, "records 数组非空")
+        rec_export = data["records"][0]
+        for field in ["objection_reason", "final_conclusion", "borrower_confirm",
+                      "borrower_remark", "status", "completed_by", "completed_at"]:
+            assert_true(field in rec_export, f"JSON 记录包含字段：{field}")
+        assert_eq(rec_export["final_conclusion"], "交接完成，测试导出",
+                  "JSON 中最终结论正确")
+        assert_eq(data["filter_info"].get("交接状态"), HandoffStatus.COMPLETED,
+                  "JSON filter_info 中记录了筛选条件")
+
+
+def test_handoff_filter_and_empty_scenario():
+    print("\n=== 测试57: 交接复核 - 多维度筛选 + 空场景边界 ===")
+    mgr = _fresh_manager()
+    mgr.switch_user("admin")
+
+    all_before = mgr.get_handoff_records()
+    assert_eq(len(all_before), 0, "初始时无交接记录")
+
+    zhangsan = next(b for b in mgr.borrowers if b.name == "张三")
+    avail = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+    rec = mgr.borrow_device(avail.id, zhangsan.id,
+                            (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S"),
+                            [], "筛选测试借用")
+    h1 = mgr.create_handoff(avail.id, HandoffAction.RETURN_BACK,
+                             source_record_id=rec.id, admin_remark="筛选测试1")
+
+    all_recs = mgr.get_handoff_records()
+    assert_eq(len(all_recs), 1, "创建后有 1 条记录")
+
+    by_device = mgr.filter_handoff_records(all_recs, device_id=avail.id)
+    assert_eq(len(by_device), 1, "按设备ID筛选命中")
+    by_device_name = mgr.filter_handoff_records(all_recs, device_id=avail.name)
+    assert_eq(len(by_device_name), 1, "按设备名称筛选命中")
+    by_holder = mgr.filter_handoff_records(all_recs, current_holder="张三")
+    assert_eq(len(by_holder), 1, "按当前持有人筛选命中")
+    by_status_pending = mgr.filter_handoff_records(all_recs,
+                                                    status_filter=HandoffStatus.PENDING)
+    assert_eq(len(by_status_pending), 1, "按待确认状态筛选命中")
+    by_status_done = mgr.filter_handoff_records(all_recs,
+                                                 status_filter=HandoffStatus.COMPLETED)
+    assert_eq(len(by_status_done), 0, "按已完成状态筛选未命中")
+    by_action = mgr.filter_handoff_records(all_recs,
+                                            action_type=HandoffAction.RETURN_BACK)
+    assert_eq(len(by_action), 1, "按归还动作筛选命中")
+    by_wrong_action = mgr.filter_handoff_records(all_recs,
+                                                  action_type=HandoffAction.BORROW_OUT)
+    assert_eq(len(by_wrong_action), 0, "按借出动作筛选未命中")
+
+    empty = mgr.filter_handoff_records([], device_id=avail.id)
+    assert_eq(len(empty), 0, "空列表筛选返回 0 条")
+
+
 def main():
     setup_test_env()
     try:
@@ -2148,6 +2545,12 @@ def main():
         test_inventory_borrower_can_only_view_own()
         test_inventory_export_completed_with_meta()
         test_inventory_create_with_filter_and_device_ids()
+        test_handoff_permission_roles()
+        test_handoff_restart_persistence()
+        test_handoff_status_conflict_all_actions()
+        test_handoff_borrower_objection_and_view_own()
+        test_handoff_export_fields_csv_and_json()
+        test_handoff_filter_and_empty_scenario()
     finally:
         cleanup_test_env()
 

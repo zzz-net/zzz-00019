@@ -6,7 +6,8 @@ from models import (
     Device, Borrower, BorrowRecord, User, Accessory,
     DeviceStatus, RecordStatus, UserRole, _now_str,
     ImportPrecheckSummary, ImportLogEntry, MaintenanceRecord,
-    InventorySession, InventoryItem, InventoryStatus, InventoryItemResult
+    InventorySession, InventoryItem, InventoryStatus, InventoryItemResult,
+    HandoffRecord, HandoffAction, HandoffStatus
 )
 import storage
 
@@ -23,6 +24,7 @@ class EquipmentManager:
         self.users: List[User] = []
         self.maintenance_logs: List[MaintenanceRecord] = []
         self.inventory_sessions: List[InventorySession] = []
+        self.handoff_records: List[HandoffRecord] = []
         self.config = storage.AppConfig()
         self.current_user: Optional[User] = None
         self._records_snapshot_at_last_maintenance: Dict[str, str] = {}
@@ -36,6 +38,7 @@ class EquipmentManager:
         self.users = storage.load_users()
         self.maintenance_logs = storage.load_maintenance_logs()
         self.inventory_sessions = storage.load_inventory_sessions()
+        self.handoff_records = storage.load_handoff_records()
         self.config = storage.load_config()
         self._records_snapshot_at_last_maintenance = dict(
             self.config.maintenance_records_snapshot or {}
@@ -50,6 +53,7 @@ class EquipmentManager:
         storage.save_users(self.users)
         storage.save_maintenance_logs(self.maintenance_logs)
         storage.save_inventory_sessions(self.inventory_sessions)
+        storage.save_handoff_records(self.handoff_records)
         storage.save_config(self.config)
 
     def find_user(self, username: str) -> Optional[User]:
@@ -1342,3 +1346,315 @@ class EquipmentManager:
                 summary["by_result"][key] = []
             summary["by_result"][key].append(it.device_name)
         return summary
+
+    def find_handoff(self, handoff_id: str) -> Optional[HandoffRecord]:
+        return next((h for h in self.handoff_records if h.id == handoff_id), None)
+
+    def _get_last_inventory_for_device(self, device_id: str) -> Optional[InventoryItem]:
+        last_item = None
+        last_time = ""
+        for s in self.inventory_sessions:
+            if s.status != InventoryStatus.COMPLETED:
+                continue
+            for it in s.items:
+                if it.device_id == device_id and it.inventory_result and it.filled_at:
+                    if it.filled_at > last_time:
+                        last_time = it.filled_at
+                        last_item = it
+                        last_item = InventoryItem(
+                            device_id=it.device_id,
+                            device_name=it.device_name,
+                            original_status=it.original_status,
+                            actual_status=it.actual_status,
+                            actual_location=it.actual_location,
+                            missing_accessories=list(it.missing_accessories),
+                            remark=it.remark,
+                            inventory_result=it.inventory_result,
+                            filled_by=it.filled_by,
+                            filled_by_role=it.filled_by_role,
+                            filled_at=it.filled_at,
+                        )
+                        last_item._session_id = s.id
+                        last_item._session_title = s.title
+        return last_item
+
+    def _get_device_current_holder(self, device_id: str) -> Tuple[str, str, str]:
+        active = self.get_active_record_for_device(device_id)
+        if active:
+            return active.borrower_id, active.borrower_name, active.status
+        device = self.find_device(device_id)
+        if device:
+            if device.status == DeviceStatus.MAINTENANCE:
+                return "maintenance", "维修中", device.status
+            if device.status == DeviceStatus.FROZEN:
+                return "frozen", "冻结中", device.status
+            return "", "", device.status
+        return "", "", ""
+
+    def _check_handoff_status_conflict(self, device_id: str,
+                                        action_type: str) -> Tuple[bool, str]:
+        device = self.find_device(device_id)
+        if not device:
+            return True, "设备不存在"
+        if action_type == HandoffAction.BORROW_OUT:
+            if device.status == DeviceStatus.BORROWED:
+                return True, f"设备【{device.name}】已借出，不能重复发起借出交接"
+            if device.status == DeviceStatus.MAINTENANCE:
+                return True, f"设备【{device.name}】正在维修中，不能借出交接"
+            if device.status == DeviceStatus.FROZEN:
+                return True, f"设备【{device.name}】处于异常冻结状态，不能借出交接"
+            if device.status == DeviceStatus.INSPECTING:
+                return True, f"设备【{device.name}】正在归还验收中，不能借出交接"
+        elif action_type == HandoffAction.RETURN_BACK:
+            if device.status != DeviceStatus.BORROWED and device.status != DeviceStatus.INSPECTING:
+                return True, (f"设备【{device.name}】当前状态为【{device.status}】，"
+                              f"不是已借出或验收中，无法发起归还交接")
+        elif action_type == HandoffAction.MAINTENANCE_BACK:
+            if device.status != DeviceStatus.MAINTENANCE:
+                return True, (f"设备【{device.name}】当前状态为【{device.status}】，"
+                              f"不是维修中，无法发起维修后交回交接")
+        elif action_type == HandoffAction.FREEZE_RELEASE:
+            if device.status != DeviceStatus.FROZEN:
+                return True, (f"设备【{device.name}】当前状态为【{device.status}】，"
+                              f"不是冻结状态，无法发起冻结解除交接")
+        return False, ""
+
+    def create_handoff(self, device_id: str, action_type: str,
+                       source_record_id: str = "",
+                       admin_remark: str = "",
+                       draft_remark: str = "",
+                       target_holder_id: str = "",
+                       target_holder_name: str = "") -> HandoffRecord:
+        self._require_permission("create_handoff")
+        device = self.find_device(device_id)
+        if not device:
+            raise BusinessError("设备不存在")
+        if action_type not in HandoffAction.ALL_ACTIONS:
+            raise BusinessError(f"不支持的交接动作：{action_type}")
+
+        has_conflict, conflict_msg = self._check_handoff_status_conflict(device_id, action_type)
+        if has_conflict:
+            raise BusinessError(
+                f"{conflict_msg}\n设备状态与交接动作冲突，已保持原状态不变。"
+                f"请先完成相关业务流程后再发起交接复核。"
+            )
+
+        holder_id, holder_name, biz_status = self._get_device_current_holder(device_id)
+
+        if action_type == HandoffAction.BORROW_OUT and target_holder_id:
+            target_holder = self.find_borrower(target_holder_id)
+            if target_holder:
+                target_holder_name = target_holder_name or target_holder.name
+
+        last_inv = self._get_last_inventory_for_device(device_id)
+        last_inv_id = ""
+        last_inv_result = ""
+        last_inv_time = ""
+        if last_inv:
+            last_inv_id = getattr(last_inv, "_session_id", "")
+            last_inv_result = last_inv.inventory_result or ""
+            last_inv_time = last_inv.filled_at or ""
+
+        record = HandoffRecord(
+            device_id=device.id,
+            device_name=device.name,
+            action_type=action_type,
+            source_record_id=source_record_id,
+            current_holder_id=holder_id,
+            current_holder_name=holder_name,
+            target_holder_id=target_holder_id,
+            target_holder_name=target_holder_name,
+            business_status=biz_status,
+            last_inventory_id=last_inv_id,
+            last_inventory_result=last_inv_result,
+            last_inventory_time=last_inv_time,
+            admin_remark=admin_remark.strip(),
+            draft_remark=draft_remark.strip(),
+            created_by=self.current_user.username if self.current_user else "",
+            created_by_role=self.current_user.role if self.current_user else "",
+            status=HandoffStatus.PENDING,
+        )
+        self.handoff_records.append(record)
+        self.save_all()
+        return record
+
+    def update_handoff_draft(self, handoff_id: str,
+                             admin_remark: str = "",
+                             draft_remark: str = "",
+                             target_holder_id: str = "",
+                             target_holder_name: str = "") -> HandoffRecord:
+        self._require_permission("edit_handoff")
+        record = self.find_handoff(handoff_id)
+        if not record:
+            raise BusinessError("交接记录不存在")
+        if record.status not in (HandoffStatus.PENDING, HandoffStatus.OBJECTED):
+            raise BusinessError(
+                f"当前交接状态为【{record.status}】，只有待确认或有异议的记录可以编辑草稿"
+            )
+        record.admin_remark = admin_remark.strip()
+        record.draft_remark = draft_remark.strip()
+        if target_holder_id:
+            record.target_holder_id = target_holder_id
+            record.target_holder_name = target_holder_name or record.target_holder_name
+        self.save_all()
+        return record
+
+    def confirm_handoff_as_borrower(self, handoff_id: str,
+                                     remark: str = "") -> HandoffRecord:
+        self._require_permission("confirm_handoff")
+        record = self.find_handoff(handoff_id)
+        if not record:
+            raise BusinessError("交接记录不存在")
+        if record.status == HandoffStatus.COMPLETED:
+            raise BusinessError("该交接已完成，不能再次确认")
+        if self.current_user:
+            username = self.current_user.username
+            display_name = self.current_user.display_name
+            related_ids = {record.current_holder_id, record.current_holder_name,
+                           record.target_holder_id, record.target_holder_name}
+            if (username not in related_ids and display_name not in related_ids):
+                raise BusinessError(
+                    f"您不是该交接的相关持有人（当前持有人：{record.current_holder_name}，"
+                    f"目标持有人：{record.target_holder_name}），无权确认此交接"
+                )
+        record.borrower_confirm = True
+        record.borrower_remark = remark.strip()
+        record.objection_reason = ""
+        record.confirmed_by = self.current_user.username if self.current_user else ""
+        record.confirmed_at = _now_str()
+        if record.status == HandoffStatus.OBJECTED:
+            record.status = HandoffStatus.PENDING
+        else:
+            record.status = HandoffStatus.CONFIRMED
+        self.save_all()
+        return record
+
+    def object_handoff_as_borrower(self, handoff_id: str,
+                                    reason: str = "",
+                                    remark: str = "") -> HandoffRecord:
+        self._require_permission("object_handoff")
+        record = self.find_handoff(handoff_id)
+        if not record:
+            raise BusinessError("交接记录不存在")
+        if record.status == HandoffStatus.COMPLETED:
+            raise BusinessError("该交接已完成，不能再提交异议")
+        if not reason or not reason.strip():
+            raise BusinessError("提出异议必须填写原因")
+        if self.current_user:
+            username = self.current_user.username
+            display_name = self.current_user.display_name
+            related_ids = {record.current_holder_id, record.current_holder_name,
+                           record.target_holder_id, record.target_holder_name}
+            if (username not in related_ids and display_name not in related_ids):
+                raise BusinessError(
+                    f"您不是该交接的相关持有人（当前持有人：{record.current_holder_name}，"
+                    f"目标持有人：{record.target_holder_name}），无权对此交接提出异议"
+                )
+        record.borrower_confirm = False
+        record.objection_reason = reason.strip()
+        record.borrower_remark = remark.strip()
+        record.status = HandoffStatus.OBJECTED
+        self.save_all()
+        return record
+
+    def complete_handoff(self, handoff_id: str,
+                         final_conclusion: str = "") -> HandoffRecord:
+        self._require_permission("complete_handoff")
+        record = self.find_handoff(handoff_id)
+        if not record:
+            raise BusinessError("交接记录不存在")
+        if record.status == HandoffStatus.COMPLETED:
+            raise BusinessError("该交接已完成")
+
+        has_conflict, conflict_msg = self._check_handoff_status_conflict(
+            record.device_id, record.action_type
+        )
+        if has_conflict:
+            raise BusinessError(
+                f"{conflict_msg}\n完成交接前发现设备状态与交接动作冲突，"
+                f"已保持原状态不变，请先处理相关业务。"
+            )
+
+        if not record.borrower_confirm and record.status != HandoffStatus.OBJECTED:
+            raise BusinessError("借用人尚未确认，无法完成交接")
+
+        record.final_conclusion = final_conclusion.strip()
+        record.completed_by = self.current_user.username if self.current_user else ""
+        record.completed_at = _now_str()
+        record.status = HandoffStatus.COMPLETED
+        if not record.confirmed_by:
+            record.confirmed_by = record.completed_by
+            record.confirmed_at = record.completed_at
+        self.save_all()
+        return record
+
+    def get_handoff_records(self) -> List[HandoffRecord]:
+        if not self.current_user:
+            return []
+        role = self.current_user.role
+        if role == UserRole.BORROWER:
+            self._require_permission("view_own_handoff")
+            name = self.current_user.display_name
+            uid = self.current_user.username
+            return [h for h in self.handoff_records
+                    if (h.current_holder_id in (name, uid)
+                        or h.current_holder_name == name
+                        or h.target_holder_id in (name, uid)
+                        or h.target_holder_name == name)]
+        self._require_permission("view_handoff_all")
+        return list(self.handoff_records)
+
+    def filter_handoff_records(self, records: List[HandoffRecord],
+                                device_id: str = "",
+                                current_holder: str = "",
+                                business_status: str = "",
+                                status_filter: str = "all",
+                                action_type: str = "all") -> List[HandoffRecord]:
+        result = list(records)
+        if device_id and device_id.strip():
+            did = device_id.strip().lower()
+            result = [h for h in result
+                      if did in h.device_id.lower()
+                      or did in (h.device_name or "").lower()]
+        if current_holder and current_holder.strip():
+            ch = current_holder.strip()
+            result = [h for h in result
+                      if ch in (h.current_holder_name or "")
+                      or ch in (h.current_holder_id or "")]
+        if business_status and business_status.strip() and business_status.strip() != "all":
+            bs = business_status.strip()
+            result = [h for h in result if h.business_status == bs]
+        if status_filter and status_filter != "all":
+            result = [h for h in result if h.status == status_filter]
+        if action_type and action_type != "all":
+            result = [h for h in result if h.action_type == action_type]
+        return result
+
+    def save_handoff_filter(self, flt: dict):
+        try:
+            self.config.last_handoff_filter = dict(flt) if flt else {}
+            self.save_all()
+        except Exception:
+            pass
+
+    def get_last_handoff_filter(self) -> dict:
+        return dict(self.config.last_handoff_filter or {})
+
+    def export_handoff_records(self, handoff_ids: List[str],
+                                filepath: str,
+                                filter_info: Optional[dict] = None) -> Tuple[bool, str]:
+        self._require_permission("export_handoff")
+        ok, reason = self.check_export_dir_detail()
+        if not ok:
+            return False, f"导出失败：{reason}\n请先设置一个可写的导出目录。"
+        selected = [h for h in self.handoff_records if h.id in handoff_ids]
+        if not selected:
+            return False, "没有选中任何交接记录"
+        operator = self.current_user.username if self.current_user else ""
+        if filepath.lower().endswith(".csv"):
+            ok = storage.export_handoff_csv(selected, filepath, filter_info, operator)
+        else:
+            ok = storage.export_handoff_json(selected, filepath, filter_info, operator)
+        if not ok:
+            return False, f"导出失败，目标文件无法写入：{filepath}"
+        return True, f"导出成功：{filepath}"

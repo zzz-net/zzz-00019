@@ -7,7 +7,8 @@ from models import (
     Device, Borrower, BorrowRecord, Accessory,
     DeviceStatus, RecordStatus, UserRole, User, _now_str,
     MaintenanceRecord, InventorySession, InventoryItem,
-    InventoryStatus, InventoryItemResult
+    InventoryStatus, InventoryItemResult,
+    HandoffRecord, HandoffAction, HandoffStatus
 )
 from business import EquipmentManager, BusinessError
 
@@ -54,6 +55,32 @@ INVENTORY_RESULT_LABELS = {
     InventoryItemResult.LOCATION_WRONG: "位置错误",
     InventoryItemResult.ACCESSORY_MISSING: "配件缺失",
     InventoryItemResult.OTHER: "其他异常",
+}
+
+HANDOFF_STATUS_LABELS = {
+    "all": "全部",
+    HandoffStatus.PENDING: "待确认",
+    HandoffStatus.CONFIRMED: "已确认",
+    HandoffStatus.OBJECTED: "有异议",
+    HandoffStatus.COMPLETED: "已完成",
+}
+
+HANDOFF_ACTION_LABELS = {
+    "all": "全部",
+    HandoffAction.BORROW_OUT: "借出",
+    HandoffAction.RETURN_BACK: "归还",
+    HandoffAction.MAINTENANCE_BACK: "维修后交回",
+    HandoffAction.FREEZE_RELEASE: "冻结解除",
+}
+
+HANDOFF_BUSINESS_STATUS_LABELS = {
+    "all": "全部",
+    RecordStatus.BORROWED: "借出中",
+    RecordStatus.INSPECTING: "归还验收中",
+    RecordStatus.RETURNED: "已归还",
+    RecordStatus.FROZEN: "异常冻结",
+    DeviceStatus.AVAILABLE: "可借出",
+    DeviceStatus.MAINTENANCE: "维修中",
 }
 
 
@@ -1301,6 +1328,12 @@ class App:
         self._selected_inventory_id: Optional[str] = None
         self._selected_inventory_item_device_id: Optional[str] = None
         self._inventory_filter_status: str = "all"
+        self._selected_handoff_ids: List[str] = []
+        self._handoff_filter_device: str = ""
+        self._handoff_filter_holder: str = ""
+        self._handoff_filter_business_status: str = "all"
+        self._handoff_filter_status: str = "all"
+        self._handoff_filter_action: str = "all"
         self._build_ui()
         self._refresh_all()
 
@@ -1353,11 +1386,14 @@ class App:
 
         records_tab = ttk.Frame(self.right_notebook)
         inventory_tab = ttk.Frame(self.right_notebook)
+        handoff_tab = ttk.Frame(self.right_notebook)
         self.right_notebook.add(records_tab, text="借用记录")
         self.right_notebook.add(inventory_tab, text="盘点工作台")
+        self.right_notebook.add(handoff_tab, text="交接复核")
 
         self._build_records_panel(records_tab)
         self._build_inventory_panel(inventory_tab)
+        self._build_handoff_panel(handoff_tab)
         self._build_maintenance_panel(left_frame)
 
         self.status_var = tk.StringVar(value="就绪")
@@ -1627,6 +1663,105 @@ class App:
         self.inv_item_tree.tag_configure("exception", foreground="#c0392b", background="#fdecea")
         self.inv_item_tree.tag_configure("unfilled", foreground="#888")
 
+    def _build_handoff_panel(self, parent):
+        frame = ttk.LabelFrame(parent, text="交接复核", padding=6)
+        frame.pack(fill="both", expand=True)
+
+        filter_row = ttk.Frame(frame)
+        filter_row.pack(fill="x", pady=(0, 4))
+
+        ttk.Label(filter_row, text="设备ID/名称:").pack(side="left", padx=(0, 2))
+        self.handoff_device_var = tk.StringVar()
+        ttk.Entry(filter_row, textvariable=self.handoff_device_var, width=16).pack(side="left", padx=(0, 6))
+
+        ttk.Label(filter_row, text="当前持有人:").pack(side="left", padx=(0, 2))
+        self.handoff_holder_var = tk.StringVar()
+        ttk.Entry(filter_row, textvariable=self.handoff_holder_var, width=12).pack(side="left", padx=(0, 6))
+
+        ttk.Label(filter_row, text="业务状态:").pack(side="left", padx=(0, 2))
+        self.handoff_biz_status_var = tk.StringVar(value=HANDOFF_BUSINESS_STATUS_LABELS["all"])
+        ttk.Combobox(filter_row, textvariable=self.handoff_biz_status_var,
+                        width=10, state="readonly",
+                        values=list(HANDOFF_BUSINESS_STATUS_LABELS.values())
+                        ).pack(side="left", padx=(0, 6))
+
+        ttk.Label(filter_row, text="交接状态:").pack(side="left", padx=(0, 2))
+        self.handoff_status_var = tk.StringVar(value=HANDOFF_STATUS_LABELS["all"])
+        ttk.Combobox(filter_row, textvariable=self.handoff_status_var,
+                        width=8, state="readonly",
+                        values=list(HANDOFF_STATUS_LABELS.values())
+                        ).pack(side="left", padx=(0, 6))
+
+        ttk.Label(filter_row, text="交接动作:").pack(side="left", padx=(0, 2))
+        self.handoff_action_var = tk.StringVar(value=HANDOFF_ACTION_LABELS["all"])
+        ttk.Combobox(filter_row, textvariable=self.handoff_action_var,
+                        width=10, state="readonly",
+                        values=list(HANDOFF_ACTION_LABELS.values())
+                        ).pack(side="left", padx=(0, 6))
+
+        self.btn_handoff_apply = ttk.Button(filter_row, text="应用筛选",
+                                               command=self._on_handoff_filter_apply)
+        self.btn_handoff_apply.pack(side="left", padx=2)
+        self.btn_handoff_reset = ttk.Button(filter_row, text="重置",
+                                               command=self._on_handoff_filter_reset)
+        self.btn_handoff_reset.pack(side="left", padx=2)
+
+        self.btn_handoff_export = ttk.Button(filter_row, text="导出选中",
+                                              command=self._export_handoff_records)
+        self.btn_handoff_export.pack(side="right", padx=2)
+        self.btn_handoff_complete = ttk.Button(filter_row, text="完成交接",
+                                                command=self._complete_handoff)
+        self.btn_handoff_complete.pack(side="right", padx=2)
+        self.btn_handoff_confirm = ttk.Button(filter_row, text="我(借用人)确认/异议",
+                                                 command=self._confirm_handoff_as_borrower)
+        self.btn_handoff_confirm.pack(side="right", padx=2)
+        self.btn_handoff_detail = ttk.Button(filter_row, text="查看详情",
+                                             command=self._view_handoff_detail)
+        self.btn_handoff_detail.pack(side="right", padx=2)
+        self.btn_handoff_create = ttk.Button(filter_row, text="新建交接",
+                                             command=self._create_handoff)
+        self.btn_handoff_create.pack(side="right", padx=2)
+
+        self.handoff_status_label = ttk.Label(filter_row, text="", foreground="#2980b9")
+        self.handoff_status_label.pack(side="right", padx=6)
+
+        tree_frame = ttk.Frame(frame)
+        tree_frame.pack(fill="both", expand=True)
+        cols = ("id", "device", "action", "holder", "target_holder",
+                 "biz_status", "inv_result", "borrower_confirm", "status", "created_at")
+        self.handoff_tree = ttk.Treeview(tree_frame, columns=cols,
+                                               show="headings", height=12, selectmode="extended")
+        self.handoff_tree.heading("id", text="记录ID")
+        self.handoff_tree.heading("device", text="设备")
+        self.handoff_tree.heading("action", text="动作")
+        self.handoff_tree.heading("holder", text="当前持有人")
+        self.handoff_tree.heading("target_holder", text="目标持有人")
+        self.handoff_tree.heading("biz_status", text="业务状态")
+        self.handoff_tree.heading("inv_result", text="盘点结论")
+        self.handoff_tree.heading("borrower_confirm", text="借用人确认")
+        self.handoff_tree.heading("status", text="状态")
+        self.handoff_tree.heading("created_at", text="创建时间")
+        self.handoff_tree.column("id", width=80, anchor="center")
+        self.handoff_tree.column("device", width=160, anchor="w")
+        self.handoff_tree.column("action", width=80, anchor="center")
+        self.handoff_tree.column("holder", width=90, anchor="w")
+        self.handoff_tree.column("target_holder", width=90, anchor="w")
+        self.handoff_tree.column("biz_status", width=80, anchor="center")
+        self.handoff_tree.column("inv_result", width=80, anchor="center")
+        self.handoff_tree.column("borrower_confirm", width=90, anchor="center")
+        self.handoff_tree.column("status", width=80, anchor="center")
+        self.handoff_tree.column("created_at", width=140, anchor="w")
+        hvsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.handoff_tree.yview)
+        self.handoff_tree.configure(yscrollcommand=hvsb.set)
+        self.handoff_tree.pack(side="left", fill="both", expand=True)
+        hvsb.pack(side="right", fill="y")
+        self.handoff_tree.bind("<<TreeviewSelect>>", self._on_handoff_selected)
+
+        self.handoff_tree.tag_configure(HandoffStatus.PENDING, foreground="#2980b9")
+        self.handoff_tree.tag_configure(HandoffStatus.CONFIRMED, foreground="#e67e22")
+        self.handoff_tree.tag_configure(HandoffStatus.OBJECTED, foreground="#c0392b", background="#fdecea")
+        self.handoff_tree.tag_configure(HandoffStatus.COMPLETED, foreground="#27ae60")
+
     def _build_records_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="借用记录", padding=6)
         frame.pack(fill="both", expand=True)
@@ -1720,9 +1855,11 @@ class App:
         self._refresh_borrowers()
         self._restore_last_maintenance_filter()
         self._restore_last_inventory_filter()
+        self._restore_last_handoff_filter()
         self._refresh_records()
         self._refresh_maintenance_logs()
         self._refresh_inventory_sessions()
+        self._refresh_handoff_records()
         self._refresh_export_dir()
         self._apply_permissions()
 
@@ -1751,6 +1888,26 @@ class App:
                 self._selected_inventory_id = session.id
                 self._inventory_filter_status = "all"
                 self.inv_status_var.set(INVENTORY_STATUS_LABELS["all"])
+
+    def _restore_last_handoff_filter(self):
+        saved = self.manager.get_last_handoff_filter()
+        if saved:
+            self._handoff_filter_device = saved.get("device_id", "")
+            self._handoff_filter_holder = saved.get("current_holder", "")
+            self._handoff_filter_business_status = saved.get("business_status", "all")
+            self._handoff_filter_status = saved.get("status_filter", "all")
+            self._handoff_filter_action = saved.get("action_type", "all")
+        self.handoff_device_var.set(self._handoff_filter_device)
+        self.handoff_holder_var.set(self._handoff_filter_holder)
+        biz_label = HANDOFF_BUSINESS_STATUS_LABELS.get(
+            self._handoff_filter_business_status, HANDOFF_BUSINESS_STATUS_LABELS["all"])
+        self.handoff_biz_status_var.set(biz_label)
+        status_label = HANDOFF_STATUS_LABELS.get(
+            self._handoff_filter_status, HANDOFF_STATUS_LABELS["all"])
+        self.handoff_status_var.set(status_label)
+        action_label = HANDOFF_ACTION_LABELS.get(
+            self._handoff_filter_action, HANDOFF_ACTION_LABELS["all"])
+        self.handoff_action_var.set(action_label)
 
     def _refresh_user_combo(self):
         values = [f"{u.username} ({u.display_name} - {u.role})" for u in self.manager.users]
@@ -1913,6 +2070,14 @@ class App:
             "fill_inventory": [self.btn_inv_fill, self.btn_inv_continue],
             "view_inventory": [self.btn_inv_apply, self.btn_inv_reset, self.btn_inv_detail],
             "export_inventory": [self.btn_inv_export],
+            "view_handoff_all": [self.btn_handoff_apply, self.btn_handoff_reset, self.btn_handoff_detail],
+            "view_own_handoff": [self.btn_handoff_confirm],
+            "create_handoff": [self.btn_handoff_create],
+            "edit_handoff": [self.btn_handoff_detail],
+            "complete_handoff": [self.btn_handoff_complete],
+            "export_handoff": [self.btn_handoff_export],
+            "confirm_handoff": [self.btn_handoff_confirm],
+            "object_handoff": [self.btn_handoff_confirm],
         }
         for perm, widgets in perm_map.items():
             enabled = self.manager.has_permission(perm)
@@ -1935,6 +2100,16 @@ class App:
             self.inv_tree.delete(*self.inv_tree.get_children())
             self.inv_item_tree.delete(*self.inv_item_tree.get_children())
             self.inv_status_label.config(text="【无权限】", foreground="#c0392b")
+
+        if not (self.manager.has_permission("view_handoff_all")
+                or self.manager.has_permission("view_own_handoff")):
+            self.handoff_device_var.set("")
+            self.handoff_holder_var.set("")
+            self.handoff_biz_status_var.set(HANDOFF_BUSINESS_STATUS_LABELS["all"])
+            self.handoff_status_var.set(HANDOFF_STATUS_LABELS["all"])
+            self.handoff_action_var.set(HANDOFF_ACTION_LABELS["all"])
+            self.handoff_tree.delete(*self.handoff_tree.get_children())
+            self.handoff_status_label.config(text="【无权限】", foreground="#c0392b")
 
     def _on_user_changed(self, _event=None):
         value = self.user_var.get()
@@ -2747,6 +2922,254 @@ class App:
         else:
             messagebox.showerror("失败", msg)
 
+    def _label_to_handoff_status_key(self, label: str) -> str:
+        for k, v in HANDOFF_STATUS_LABELS.items():
+            if v == label:
+                return k
+        return "all"
+
+    def _label_to_handoff_action_key(self, label: str) -> str:
+        for k, v in HANDOFF_ACTION_LABELS.items():
+            if v == label:
+                return k
+        return "all"
+
+    def _label_to_handoff_biz_status_key(self, label: str) -> str:
+        for k, v in HANDOFF_BUSINESS_STATUS_LABELS.items():
+            if v == label:
+                return k
+        return "all"
+
+    def _on_handoff_filter_apply(self):
+        self._handoff_filter_device = self.handoff_device_var.get().strip()
+        self._handoff_filter_holder = self.handoff_holder_var.get().strip()
+        self._handoff_filter_business_status = self._label_to_handoff_biz_status_key(
+            self.handoff_biz_status_var.get())
+        self._handoff_filter_status = self._label_to_handoff_status_key(
+            self.handoff_status_var.get())
+        self._handoff_filter_action = self._label_to_handoff_action_key(
+            self.handoff_action_var.get())
+        self.manager.save_handoff_filter({
+            "device_id": self._handoff_filter_device,
+            "current_holder": self._handoff_filter_holder,
+            "business_status": self._handoff_filter_business_status,
+            "status_filter": self._handoff_filter_status,
+            "action_type": self._handoff_filter_action,
+        })
+        self._refresh_handoff_records()
+        self.status_var.set("交接复核筛选已应用")
+
+    def _on_handoff_filter_reset(self):
+        self._handoff_filter_device = ""
+        self._handoff_filter_holder = ""
+        self._handoff_filter_business_status = "all"
+        self._handoff_filter_status = "all"
+        self._handoff_filter_action = "all"
+        self.handoff_device_var.set("")
+        self.handoff_holder_var.set("")
+        self.handoff_biz_status_var.set(HANDOFF_BUSINESS_STATUS_LABELS["all"])
+        self.handoff_status_var.set(HANDOFF_STATUS_LABELS["all"])
+        self.handoff_action_var.set(HANDOFF_ACTION_LABELS["all"])
+        self.manager.save_handoff_filter({})
+        self._refresh_handoff_records()
+        self.status_var.set("交接复核筛选已重置")
+
+    def _on_handoff_selected(self, _event=None):
+        sel = self.handoff_tree.selection()
+        self._selected_handoff_ids = list(sel)
+
+    def _refresh_handoff_records(self):
+        if not (self.manager.has_permission("view_handoff_all")
+                or self.manager.has_permission("view_own_handoff")):
+            self.handoff_tree.delete(*self.handoff_tree.get_children())
+            self.handoff_status_label.config(text="【无权限】", foreground="#c0392b")
+            return
+        try:
+            all_records = self.manager.get_handoff_records()
+        except BusinessError:
+            self.handoff_tree.delete(*self.handoff_tree.get_children())
+            self.handoff_status_label.config(text="【无权限】", foreground="#c0392b")
+            return
+        filtered = self.manager.filter_handoff_records(
+            all_records,
+            device_id=self._handoff_filter_device,
+            current_holder=self._handoff_filter_holder,
+            business_status=self._handoff_filter_business_status,
+            status_filter=self._handoff_filter_status,
+            action_type=self._handoff_filter_action,
+        )
+        current_selection = list(self.handoff_tree.selection())
+        if current_selection:
+            self._selected_handoff_ids = current_selection
+        self.handoff_tree.delete(*self.handoff_tree.get_children())
+        visible_ids = set()
+        for h in sorted(filtered, key=lambda x: x.created_at, reverse=True):
+            borrower_confirm_text = "是" if h.borrower_confirm else "否"
+            self.handoff_tree.insert("", "end", iid=h.id, values=(
+                h.id, h.device_name, h.action_type,
+                h.current_holder_name or "-", h.target_holder_name or "-",
+                h.business_status or "-",
+                h.last_inventory_result or "-",
+                borrower_confirm_text,
+                h.status, h.created_at
+            ), tags=(h.status,))
+            visible_ids.add(h.id)
+        to_restore = [hid for hid in self._selected_handoff_ids if hid in visible_ids]
+        if to_restore:
+            try:
+                self.handoff_tree.selection_set(to_restore)
+            except Exception:
+                pass
+        total = len(all_records)
+        shown = len(filtered)
+        parts = [f"显示 {shown}/{total} 条"]
+        if self._handoff_filter_status != "all":
+            parts.append(f"（{HANDOFF_STATUS_LABELS[self._handoff_filter_status]}）")
+        if self._handoff_filter_action != "all":
+            parts.append(f"（{HANDOFF_ACTION_LABELS[self._handoff_filter_action]}）")
+        if self._handoff_filter_device:
+            parts.append(f"设备={self._handoff_filter_device}")
+        if self._handoff_filter_holder:
+            parts.append(f"持有人={self._handoff_filter_holder}")
+        if shown == 0 and (self._handoff_filter_status != "all"
+                            or self._handoff_filter_action != "all"
+                            or self._handoff_filter_device
+                            or self._handoff_filter_holder
+                            or self._handoff_filter_business_status != "all"):
+            parts.append("- 该筛选下无记录")
+        self.handoff_status_label.config(text="  ".join(parts), foreground="#2980b9")
+
+    def _create_handoff(self):
+        if not self.manager.has_permission("create_handoff"):
+            messagebox.showerror("无权限", "当前角色不能新建交接复核。")
+            return
+        dlg = CreateHandoffDialog(self.root, self.manager)
+        self.root.wait_window(dlg)
+        if dlg.result:
+            self._refresh_handoff_records()
+            self.status_var.set(f"交接记录已创建：{dlg.result.id}")
+
+    def _view_handoff_detail(self):
+        if not self.manager.has_permission("view_handoff_all"):
+            messagebox.showerror("无权限", "当前角色不能查看交接详情。")
+            return
+        if not self._selected_handoff_ids:
+            messagebox.showinfo("提示", "请先选择一条交接记录")
+            return
+        handoff_id = self._selected_handoff_ids[0]
+        record = self.manager.find_handoff(handoff_id)
+        if not record:
+            return
+        dlg = HandoffDetailDialog(self.root, self.manager, record)
+        self.root.wait_window(dlg)
+        if dlg.result in ("saved", "completed"):
+            self._refresh_handoff_records()
+            if dlg.result == "completed":
+                self.status_var.set("交接已完成")
+            else:
+                self.status_var.set("交接草稿已保存")
+
+    def _complete_handoff(self):
+        if not self.manager.has_permission("complete_handoff"):
+            messagebox.showerror("无权限", "当前角色不能完成交接。")
+            return
+        if not self._selected_handoff_ids:
+            messagebox.showinfo("提示", "请先选择一条交接记录")
+            return
+        handoff_id = self._selected_handoff_ids[0]
+        record = self.manager.find_handoff(handoff_id)
+        if not record:
+            return
+        if record.status == HandoffStatus.COMPLETED:
+            messagebox.showinfo("提示", "该交接已经完成。")
+            return
+        conclusion = simpledialog.askstring("完成交接", "最终结论:", parent=self.root)
+        try:
+            self.manager.complete_handoff(handoff_id, conclusion or "")
+            self._refresh_handoff_records()
+            self.status_var.set("交接已完成")
+        except BusinessError as e:
+            messagebox.showerror("失败", str(e))
+
+    def _confirm_handoff_as_borrower(self):
+        if not (self.manager.has_permission("confirm_handoff")
+                or self.manager.has_permission("object_handoff")):
+            messagebox.showerror("无权限", "当前角色不能进行交接确认。")
+            return
+        if not self._selected_handoff_ids:
+            messagebox.showinfo("提示", "请先选择一条需要您确认的交接记录")
+            return
+        handoff_id = self._selected_handoff_ids[0]
+        record = self.manager.find_handoff(handoff_id)
+        if not record:
+            return
+        dlg = BorrowerConfirmDialog(self.root, self.manager, record)
+        self.root.wait_window(dlg)
+        if dlg.result in ("confirmed", "objected"):
+            self._refresh_handoff_records()
+            if dlg.result == "confirmed":
+                self.status_var.set("您已确认交接")
+            else:
+                self.status_var.set("异议已提交")
+
+    def _export_handoff_records(self):
+        if not self.manager.has_permission("export_handoff"):
+            messagebox.showerror("无权限", "当前角色不能导出交接记录。")
+            return
+        sel = self.handoff_tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先在交接记录列表中选择要导出的记录（支持多选）")
+            return
+        if not self._check_export_dir():
+            return
+        status_desc = HANDOFF_STATUS_LABELS.get(self._handoff_filter_status, "全部")
+        action_desc = HANDOFF_ACTION_LABELS.get(self._handoff_filter_action, "全部")
+        default_name = (f"交接复核_{status_desc}_{action_desc}_"
+                         f"{_now_str().replace(':', '-').replace(' ', '_')}")
+        filepath = filedialog.asksaveasfilename(
+            title="导出交接记录",
+            initialdir=self.manager.config.export_dir,
+            initialfile=default_name,
+            defaultextension=".csv",
+            filetypes=[("CSV 表格", "*.csv"), ("JSON 数据", "*.json")]
+        )
+        if not filepath:
+            return
+        if not filepath.startswith(self.manager.config.export_dir):
+            if not messagebox.askyesno("目录不匹配",
+                                       f"所选路径不在设置的导出目录下。\n"
+                                       f"导出目录: {self.manager.config.export_dir}\n"
+                                       f"确定继续导出？"):
+                return
+        filter_info = {
+            "description": f"交接复核记录（{status_desc} / {action_desc}）",
+            "筛选-交接状态": status_desc,
+            "筛选-交接动作": action_desc,
+            "筛选-设备ID/名称": self._handoff_filter_device or "（未指定）",
+            "筛选-当前持有人": self._handoff_filter_holder or "（未指定）",
+            "筛选-业务状态": HANDOFF_BUSINESS_STATUS_LABELS.get(
+                self._handoff_filter_business_status, "全部"),
+            "导出时间": _now_str(),
+            "操作人": (f"{self.manager.current_user.display_name} "
+                        f"({self.manager.current_user.username})"
+                        if self.manager.current_user else "unknown"),
+            "角色": self.manager.current_user.role if self.manager.current_user else "unknown",
+            "可见记录数": len(self.manager.filter_handoff_records(
+                self.manager.handoff_records,
+                device_id=self._handoff_filter_device,
+                current_holder=self._handoff_filter_holder,
+                business_status=self._handoff_filter_business_status,
+                status_filter=self._handoff_filter_status,
+                action_type=self._handoff_filter_action,
+            )),
+            "本次选中导出数": len(sel),
+        }
+        ok, msg = self.manager.export_handoff_records(list(sel), filepath, filter_info)
+        if ok:
+            messagebox.showinfo("成功", f"{msg}\n\n共导出 {len(sel)} 条交接记录")
+        else:
+            messagebox.showerror("失败", msg)
+
 
 class ImportPrecheckDialog(tk.Toplevel):
     def __init__(self, master, filepath: str, summary):
@@ -2838,6 +3261,385 @@ class ImportPrecheckDialog(tk.Toplevel):
     def _ok(self):
         self.confirmed = True
         self.destroy()
+
+
+class CreateHandoffDialog(tk.Toplevel):
+    def __init__(self, master, manager: EquipmentManager):
+        super().__init__(master)
+        self.title("新建交接复核")
+        self.geometry("560x560")
+        self.resizable(False, False)
+        self.manager = manager
+        self.result = None
+        self._build()
+        self.grab_set()
+        self.transient(master)
+
+    def _build(self):
+        main = ttk.Frame(self, padding=12)
+        main.pack(fill="both", expand=True)
+
+        ttk.Label(main, text="设备 *:").grid(row=0, column=0, sticky="ne", pady=4)
+        self.device_var = tk.StringVar()
+        device_values = [f"{d.id} - {d.name} ({d.status})" for d in self.manager.devices]
+        device_combo = ttk.Combobox(main, textvariable=self.device_var,
+                                    values=device_values, state="readonly", width=55)
+        device_combo.grid(row=0, column=1, pady=4, sticky="w")
+
+        ttk.Label(main, text="交接动作 *:").grid(row=1, column=0, sticky="ne", pady=4)
+        self.action_var = tk.StringVar()
+        action_combo = ttk.Combobox(main, textvariable=self.action_var,
+                                    state="readonly", width=52,
+                                    values=HandoffAction.ALL_ACTIONS)
+        action_combo.grid(row=1, column=1, pady=4, sticky="w")
+        action_combo.current(0)
+
+        ttk.Label(main, text="关联业务单ID:").grid(row=2, column=0, sticky="ne", pady=4)
+        self.source_var = tk.StringVar()
+        ttk.Entry(main, textvariable=self.source_var, width=55).grid(
+            row=2, column=1, pady=4, sticky="w")
+
+        ttk.Label(main, text="目标持有人(借出时指定):").grid(row=3, column=0, sticky="ne", pady=4)
+        self.target_var = tk.StringVar()
+        borrower_values = [""] + [f"{b.id} - {b.name} ({b.department})" for b in self.manager.borrowers]
+        ttk.Combobox(main, textvariable=self.target_var,
+                     values=borrower_values, state="readonly", width=52
+                     ).grid(row=3, column=1, pady=4, sticky="w")
+
+        ttk.Label(main, text="管理员备注:").grid(row=4, column=0, sticky="ne", pady=4)
+        self.admin_remark_text = tk.Text(main, width=52, height=3)
+        self.admin_remark_text.grid(row=4, column=1, pady=4, sticky="w")
+
+        ttk.Label(main, text="草稿备注(内部):").grid(row=5, column=0, sticky="ne", pady=4)
+        self.draft_remark_text = tk.Text(main, width=52, height=3)
+        self.draft_remark_text.grid(row=5, column=1, pady=4, sticky="w")
+
+        tip = ttk.Label(main, text="提示：创建时会自动校验设备状态与交接动作是否冲突，\n"
+                                   "若冲突将保留原状态不变，不会静默覆盖。",
+                        foreground="#2980b9", justify="left")
+        tip.grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        btns = ttk.Frame(main)
+        btns.grid(row=7, column=0, columnspan=2, pady=(12, 0))
+        ttk.Button(btns, text="创建交接", command=self._ok).pack(side="left", padx=6)
+        ttk.Button(btns, text="取消", command=self.destroy).pack(side="left", padx=6)
+
+    def _ok(self):
+        if not self.device_var.get():
+            messagebox.showerror("错误", "请选择设备", parent=self)
+            return
+        device_id = self.device_var.get().split(" - ")[0]
+        action_type = self.action_var.get().strip()
+        if not action_type:
+            messagebox.showerror("错误", "请选择交接动作", parent=self)
+            return
+
+        target_holder_id = ""
+        target_holder_name = ""
+        if self.target_var.get():
+            parts = self.target_var.get().split(" - ")
+            target_holder_id = parts[0]
+            if len(parts) >= 2:
+                name_part = parts[1]
+                if " (" in name_part:
+                    target_holder_name = name_part.split(" (")[0]
+                else:
+                    target_holder_name = name_part
+
+        try:
+            record = self.manager.create_handoff(
+                device_id=device_id,
+                action_type=action_type,
+                source_record_id=self.source_var.get().strip(),
+                admin_remark=self.admin_remark_text.get("1.0", "end").strip(),
+                draft_remark=self.draft_remark_text.get("1.0", "end").strip(),
+                target_holder_id=target_holder_id,
+                target_holder_name=target_holder_name,
+            )
+            self.result = record
+            messagebox.showinfo("成功", f"交接记录已创建！\n记录ID: {record.id}", parent=self)
+            self.destroy()
+        except BusinessError as e:
+            messagebox.showerror("创建失败", str(e), parent=self)
+
+
+class HandoffDetailDialog(tk.Toplevel):
+    def __init__(self, master, manager: EquipmentManager, record: HandoffRecord):
+        super().__init__(master)
+        self.title(f"交接复核详情 - {record.device_name}")
+        self.geometry("720x720")
+        self.minsize(640, 600)
+        self.manager = manager
+        self.record = record
+        self.result = None
+        self._build()
+        self.grab_set()
+        self.transient(master)
+
+    def _build(self):
+        main = ttk.Frame(self, padding=12)
+        main.pack(fill="both", expand=True)
+
+        r = self.record
+        is_admin_or_inspector = False
+        if self.manager.current_user:
+            is_admin_or_inspector = self.manager.current_user.role in (
+                UserRole.ADMIN, UserRole.INSPECTOR
+            )
+        can_edit = is_admin_or_inspector and r.status in (
+            HandoffStatus.PENDING, HandoffStatus.OBJECTED
+        )
+        can_complete = is_admin_or_inspector and r.status != HandoffStatus.COMPLETED
+
+        info_frame = ttk.LabelFrame(main, text="交接概要", padding=8)
+        info_frame.pack(fill="x", pady=(0, 8))
+
+        status_color = "#27ae60" if r.status == HandoffStatus.COMPLETED else (
+            "#c0392b" if r.status == HandoffStatus.OBJECTED else (
+                "#e67e22" if r.status == HandoffStatus.CONFIRMED else "#2980b9"
+            )
+        )
+        ttk.Label(info_frame, text=f"记录ID: {r.id}").grid(row=0, column=0, sticky="w")
+        ttk.Label(info_frame, text=f"状态: {r.status}", foreground=status_color).grid(
+            row=0, column=1, sticky="w", padx=20)
+        ttk.Label(info_frame, text=f"交接动作: {r.action_type}").grid(
+            row=0, column=2, sticky="w", padx=20)
+
+        ttk.Label(info_frame, text=f"设备: {r.device_name} ({r.device_id})").grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=2)
+        ttk.Label(info_frame, text=f"业务状态: {r.business_status or '-'}").grid(
+            row=1, column=2, sticky="w", padx=20, pady=2)
+
+        ttk.Label(info_frame, text=f"当前持有人: {r.current_holder_name or '-'} "
+                                   f"({r.current_holder_id or '-'})").grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=2)
+        ttk.Label(info_frame, text=f"目标持有人: {r.target_holder_name or '-'} "
+                                   f"({r.target_holder_id or '-'})").grid(
+            row=2, column=2, sticky="w", padx=20, pady=2)
+
+        ttk.Label(info_frame, text=f"创建人: {r.created_by} ({r.created_by_role})").grid(
+            row=3, column=0, sticky="w", pady=2)
+        ttk.Label(info_frame, text=f"创建时间: {r.created_at}").grid(
+            row=3, column=1, sticky="w", padx=20, pady=2)
+        if r.confirmed_by:
+            ttk.Label(info_frame, text=f"确认人: {r.confirmed_by}").grid(
+                row=4, column=0, sticky="w", pady=2)
+            ttk.Label(info_frame, text=f"确认时间: {r.confirmed_at}").grid(
+                row=4, column=1, sticky="w", padx=20, pady=2)
+        if r.completed_by:
+            ttk.Label(info_frame, text=f"处理人: {r.completed_by}").grid(
+                row=5, column=0, sticky="w", pady=2)
+            ttk.Label(info_frame, text=f"完成时间: {r.completed_at}").grid(
+                row=5, column=1, sticky="w", padx=20, pady=2)
+
+        if r.source_record_id:
+            source_frame = ttk.LabelFrame(main, text="关联业务单", padding=8)
+            source_frame.pack(fill="x", pady=(0, 8))
+            src_rec = self.manager.find_record(r.source_record_id)
+            if src_rec:
+                ttk.Label(source_frame, text=f"借用记录: {src_rec.id}").grid(
+                    row=0, column=0, sticky="w")
+                ttk.Label(source_frame, text=f"设备: {src_rec.device_name}").grid(
+                    row=0, column=1, sticky="w", padx=20)
+                ttk.Label(source_frame, text=f"借用人: {src_rec.borrower_name}").grid(
+                    row=0, column=2, sticky="w", padx=20)
+                ttk.Label(source_frame, text=f"状态: {src_rec.status}").grid(
+                    row=1, column=0, sticky="w", pady=2)
+                ttk.Label(source_frame, text=f"借出时间: {src_rec.borrow_time}").grid(
+                    row=1, column=1, sticky="w", padx=20, pady=2)
+                if src_rec.remark:
+                    ttk.Label(source_frame, text=f"备注: {src_rec.remark[:80]}").grid(
+                        row=2, column=0, columnspan=3, sticky="w", pady=2)
+            else:
+                ttk.Label(source_frame, text=f"业务单ID: {r.source_record_id}（未找到对应记录）",
+                          foreground="#888").pack(anchor="w")
+
+        inv_frame = ttk.LabelFrame(main, text="最近盘点结论", padding=8)
+        inv_frame.pack(fill="x", pady=(0, 8))
+        if r.last_inventory_id:
+            ttk.Label(inv_frame, text=f"盘点ID: {r.last_inventory_id}").grid(
+                row=0, column=0, sticky="w")
+            ttk.Label(inv_frame, text=f"结论: {r.last_inventory_result or '-'}").grid(
+                row=0, column=1, sticky="w", padx=20)
+            ttk.Label(inv_frame, text=f"盘点时间: {r.last_inventory_time or '-'}").grid(
+                row=0, column=2, sticky="w", padx=20)
+        else:
+            ttk.Label(inv_frame, text="暂无已完成的盘点记录", foreground="#888").pack(anchor="w")
+
+        borrow_frame = ttk.LabelFrame(main, text="借用人确认信息", padding=8)
+        borrow_frame.pack(fill="x", pady=(0, 8))
+        confirm_text = "已确认" if r.borrower_confirm else "未确认"
+        confirm_color = "#27ae60" if r.borrower_confirm else "#c0392b"
+        ttk.Label(borrow_frame, text=f"确认状态: {confirm_text}", foreground=confirm_color).grid(
+            row=0, column=0, sticky="w")
+        if r.borrower_remark:
+            ttk.Label(borrow_frame, text=f"借用人备注: {r.borrower_remark}").grid(
+                row=1, column=0, columnspan=3, sticky="w", pady=2)
+        if r.objection_reason:
+            ttk.Label(borrow_frame, text=f"异议原因: {r.objection_reason}",
+                      foreground="#c0392b").grid(
+                row=2, column=0, columnspan=3, sticky="w", pady=2)
+
+        if is_admin_or_inspector:
+            edit_frame = ttk.LabelFrame(main, text="管理员编辑（仅待确认/有异议时可改）", padding=8)
+            edit_frame.pack(fill="x", pady=(0, 8))
+
+            ttk.Label(edit_frame, text="管理员备注:").grid(row=0, column=0, sticky="ne", pady=4)
+            self.admin_remark_text = tk.Text(edit_frame, width=65, height=2)
+            self.admin_remark_text.grid(row=0, column=1, pady=4, sticky="w")
+            self.admin_remark_text.insert("1.0", r.admin_remark or "")
+            if not can_edit:
+                self.admin_remark_text.config(state="disabled")
+
+            ttk.Label(edit_frame, text="草稿备注:").grid(row=1, column=0, sticky="ne", pady=4)
+            self.draft_remark_text = tk.Text(edit_frame, width=65, height=2)
+            self.draft_remark_text.grid(row=1, column=1, pady=4, sticky="w")
+            self.draft_remark_text.insert("1.0", r.draft_remark or "")
+            if not can_edit:
+                self.draft_remark_text.config(state="disabled")
+
+            ttk.Label(edit_frame, text="最终结论:").grid(row=2, column=0, sticky="ne", pady=4)
+            self.conclusion_text = tk.Text(edit_frame, width=65, height=2)
+            self.conclusion_text.grid(row=2, column=1, pady=4, sticky="w")
+            self.conclusion_text.insert("1.0", r.final_conclusion or "")
+            if not can_complete or r.status == HandoffStatus.COMPLETED:
+                self.conclusion_text.config(state="disabled")
+
+        btns = ttk.Frame(main)
+        btns.pack(pady=(10, 0))
+        if is_admin_or_inspector:
+            if can_edit:
+                ttk.Button(btns, text="保存草稿", command=self._save_draft).pack(side="left", padx=4)
+            if can_complete:
+                ttk.Button(btns, text="完成交接", command=self._complete).pack(side="left", padx=4)
+        ttk.Button(btns, text="关闭", command=self.destroy).pack(side="left", padx=6)
+
+    def _save_draft(self):
+        try:
+            self.manager.update_handoff_draft(
+                handoff_id=self.record.id,
+                admin_remark=self.admin_remark_text.get("1.0", "end").strip(),
+                draft_remark=self.draft_remark_text.get("1.0", "end").strip(),
+            )
+            self.result = "saved"
+            messagebox.showinfo("成功", "草稿备注已保存", parent=self)
+        except BusinessError as e:
+            messagebox.showerror("保存失败", str(e), parent=self)
+
+    def _complete(self):
+        conclusion = self.conclusion_text.get("1.0", "end").strip()
+        if not conclusion:
+            if not messagebox.askyesno("确认", "最终结论为空，是否仍然完成交接？", parent=self):
+                return
+        try:
+            self.manager.complete_handoff(self.record.id, conclusion)
+            self.result = "completed"
+            messagebox.showinfo("成功", "交接已完成", parent=self)
+            self.destroy()
+        except BusinessError as e:
+            messagebox.showerror("完成失败", str(e), parent=self)
+
+
+class BorrowerConfirmDialog(tk.Toplevel):
+    def __init__(self, master, manager: EquipmentManager, record: HandoffRecord):
+        super().__init__(master)
+        self.title(f"交接确认 - {record.device_name}")
+        self.geometry("600x560")
+        self.resizable(False, False)
+        self.manager = manager
+        self.record = record
+        self.result = None
+        self._build()
+        self.grab_set()
+        self.transient(master)
+
+    def _build(self):
+        main = ttk.Frame(self, padding=12)
+        main.pack(fill="both", expand=True)
+
+        r = self.record
+
+        info_frame = ttk.LabelFrame(main, text="交接信息", padding=8)
+        info_frame.pack(fill="x", pady=(0, 8))
+
+        ttk.Label(info_frame, text=f"设备: {r.device_name}").grid(row=0, column=0, sticky="w")
+        ttk.Label(info_frame, text=f"交接动作: {r.action_type}").grid(
+            row=0, column=1, sticky="w", padx=20)
+
+        ttk.Label(info_frame, text=f"当前持有人: {r.current_holder_name or '-'}").grid(
+            row=1, column=0, sticky="w", pady=2)
+        if r.target_holder_name:
+            ttk.Label(info_frame, text=f"目标持有人: {r.target_holder_name}").grid(
+                row=1, column=1, sticky="w", padx=20, pady=2)
+
+        ttk.Label(info_frame, text=f"业务状态: {r.business_status or '-'}").grid(
+            row=2, column=0, sticky="w", pady=2)
+        ttk.Label(info_frame, text=f"创建时间: {r.created_at}").grid(
+            row=2, column=1, sticky="w", padx=20, pady=2)
+
+        if r.admin_remark:
+            ttk.Label(info_frame, text=f"管理员备注: {r.admin_remark}").grid(
+                row=3, column=0, columnspan=2, sticky="w", pady=2)
+
+        if r.last_inventory_result:
+            inv_frame = ttk.LabelFrame(main, text="最近盘点", padding=8)
+            inv_frame.pack(fill="x", pady=(0, 8))
+            ttk.Label(inv_frame, text=f"结论: {r.last_inventory_result}").grid(
+                row=0, column=0, sticky="w")
+            ttk.Label(inv_frame, text=f"盘点时间: {r.last_inventory_time or '-'}").grid(
+                row=0, column=1, sticky="w", padx=20)
+
+        ttk.Label(main, text="您的备注:").pack(anchor="w")
+        self.remark_text = tk.Text(main, width=65, height=3)
+        self.remark_text.pack(fill="x", pady=(2, 8))
+        if r.borrower_remark:
+            self.remark_text.insert("1.0", r.borrower_remark)
+
+        ttk.Label(main, text="若有异议，请填写原因后点击【提出异议】:", foreground="#c0392b").pack(anchor="w")
+        self.objection_text = tk.Text(main, width=65, height=3)
+        self.objection_text.pack(fill="x", pady=(2, 8))
+        if r.objection_reason:
+            self.objection_text.insert("1.0", r.objection_reason)
+
+        already_completed = r.status == HandoffStatus.COMPLETED
+
+        btns = ttk.Frame(main)
+        btns.pack(pady=(10, 0))
+        if already_completed:
+            ttk.Label(btns, text="此交接已完成，无法再操作", foreground="#888").pack(side="left")
+        else:
+            ttk.Button(btns, text="确认交接无误", command=self._confirm).pack(side="left", padx=6)
+            ttk.Button(btns, text="提出异议", command=self._object).pack(side="left", padx=6)
+        ttk.Button(btns, text="关闭", command=self.destroy).pack(side="left", padx=6)
+
+    def _confirm(self):
+        try:
+            self.manager.confirm_handoff_as_borrower(
+                handoff_id=self.record.id,
+                remark=self.remark_text.get("1.0", "end").strip(),
+            )
+            self.result = "confirmed"
+            messagebox.showinfo("成功", "已确认交接", parent=self)
+            self.destroy()
+        except BusinessError as e:
+            messagebox.showerror("操作失败", str(e), parent=self)
+
+    def _object(self):
+        reason = self.objection_text.get("1.0", "end").strip()
+        if not reason:
+            messagebox.showerror("错误", "请填写异议原因", parent=self)
+            return
+        try:
+            self.manager.object_handoff_as_borrower(
+                handoff_id=self.record.id,
+                reason=reason,
+                remark=self.remark_text.get("1.0", "end").strip(),
+            )
+            self.result = "objected"
+            messagebox.showinfo("成功", "异议已提交", parent=self)
+            self.destroy()
+        except BusinessError as e:
+            messagebox.showerror("操作失败", str(e), parent=self)
 
 
 def main():

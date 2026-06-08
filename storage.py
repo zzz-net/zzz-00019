@@ -2,12 +2,13 @@ import os
 import json
 import csv
 import copy
+import sqlite3
 from typing import List, Optional, Tuple, Dict
 from models import (
     Device, Borrower, BorrowRecord, User, AppConfig,
     DeviceStatus, RecordStatus, UserRole, Accessory, _now_str,
     ImportPrecheckSummary, ImportLogEntry, MaintenanceRecord,
-    InventorySession, InventoryItem
+    InventorySession, InventoryItem, HandoffRecord, HandoffStatus
 )
 
 
@@ -20,6 +21,7 @@ CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 IMPORT_LOGS_FILE = os.path.join(DATA_DIR, "import_logs.json")
 MAINTENANCE_LOGS_FILE = os.path.join(DATA_DIR, "maintenance_logs.json")
 INVENTORY_FILE = os.path.join(DATA_DIR, "inventory_sessions.json")
+HANDOFF_DB_FILE = os.path.join(DATA_DIR, "handover_records.db")
 
 
 IMPORT_REQUIRED_FIELDS = [
@@ -501,6 +503,201 @@ def export_inventory_json(session: InventorySession, filepath: str,
                 "exception_count": exception_count,
                 "session": session.to_dict(),
             }
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except (IOError, OSError):
+        return False
+
+
+HANDOFF_FIELDS = [
+    "id", "device_id", "device_name", "action_type", "source_record_id",
+    "current_holder_id", "current_holder_name", "target_holder_id",
+    "target_holder_name", "business_status", "last_inventory_id",
+    "last_inventory_result", "last_inventory_time", "admin_remark",
+    "draft_remark", "borrower_confirm", "borrower_remark",
+    "objection_reason", "created_by", "created_by_role", "created_at",
+    "confirmed_by", "confirmed_at", "completed_by", "completed_at",
+    "final_conclusion", "status"
+]
+
+
+def _get_handoff_conn():
+    _ensure_data_dir()
+    conn = sqlite3.connect(HANDOFF_DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS handoff_records (
+            id TEXT PRIMARY KEY,
+            device_id TEXT,
+            device_name TEXT,
+            action_type TEXT,
+            source_record_id TEXT,
+            current_holder_id TEXT,
+            current_holder_name TEXT,
+            target_holder_id TEXT,
+            target_holder_name TEXT,
+            business_status TEXT,
+            last_inventory_id TEXT,
+            last_inventory_result TEXT,
+            last_inventory_time TEXT,
+            admin_remark TEXT,
+            draft_remark TEXT,
+            borrower_confirm INTEGER,
+            borrower_remark TEXT,
+            objection_reason TEXT,
+            created_by TEXT,
+            created_by_role TEXT,
+            created_at TEXT,
+            confirmed_by TEXT,
+            confirmed_at TEXT,
+            completed_by TEXT,
+            completed_at TEXT,
+            final_conclusion TEXT,
+            status TEXT
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def save_handoff_records(records: List[HandoffRecord]):
+    conn = _get_handoff_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM handoff_records")
+        for r in records:
+            values = []
+            for f in HANDOFF_FIELDS:
+                v = getattr(r, f)
+                if isinstance(v, bool):
+                    v = 1 if v else 0
+                values.append(v)
+            placeholders = ", ".join(["?"] * len(HANDOFF_FIELDS))
+            cur.execute(
+                f"INSERT INTO handoff_records ({', '.join(HANDOFF_FIELDS)}) VALUES ({placeholders})",
+                values
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_handoff_records() -> List[HandoffRecord]:
+    conn = _get_handoff_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT {', '.join(HANDOFF_FIELDS)} FROM handoff_records ORDER BY created_at DESC")
+        rows = cur.fetchall()
+        result = []
+        for row in rows:
+            d = dict(row)
+            if "borrower_confirm" in d:
+                d["borrower_confirm"] = bool(d["borrower_confirm"])
+            result.append(HandoffRecord.from_dict(d))
+        return result
+    finally:
+        conn.close()
+
+
+def upsert_handoff_record(record: HandoffRecord):
+    conn = _get_handoff_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM handoff_records WHERE id = ?", (record.id,))
+        exists = cur.fetchone()
+        values = []
+        for f in HANDOFF_FIELDS:
+            v = getattr(record, f)
+            if isinstance(v, bool):
+                v = 1 if v else 0
+            values.append(v)
+        if exists:
+            assignments = ", ".join([f"{f} = ?" for f in HANDOFF_FIELDS])
+            cur.execute(
+                f"UPDATE handoff_records SET {assignments} WHERE id = ?",
+                values + [record.id]
+            )
+        else:
+            placeholders = ", ".join(["?"] * len(HANDOFF_FIELDS))
+            cur.execute(
+                f"INSERT INTO handoff_records ({', '.join(HANDOFF_FIELDS)}) VALUES ({placeholders})",
+                values
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_handoff_record(record_id: str):
+    conn = _get_handoff_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM handoff_records WHERE id = ?", (record_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def export_handoff_csv(records: List[HandoffRecord], filepath: str,
+                       filter_info: Optional[dict] = None,
+                       operator: str = "") -> bool:
+    try:
+        with open(filepath, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            if filter_info:
+                writer.writerow([f"# 导出筛选条件: {filter_info.get('description', '')}"])
+                for k, v in filter_info.items():
+                    if k != "description" and k != "_alert_status":
+                        writer.writerow([f"# {k}: {v}"])
+            writer.writerow([f"# 导出操作人: {operator}"])
+            writer.writerow([f"# 导出时间: {_now_str()}"])
+            writer.writerow([
+                "交接记录ID", "设备ID", "设备名称", "交接动作", "关联业务单ID",
+                "当前持有人ID", "当前持有人",
+                "目标持有人ID", "目标持有人",
+                "业务状态",
+                "最近盘点ID", "最近盘点结论", "最近盘点时间",
+                "管理员备注", "草稿备注",
+                "借用人是否确认", "借用人确认备注", "异议原因",
+                "创建人", "创建人角色", "创建时间",
+                "确认人", "确认时间",
+                "处理人(完成)", "完成时间",
+                "最终结论", "当前状态"
+            ])
+            for r in records:
+                writer.writerow([
+                    r.id, r.device_id, r.device_name, r.action_type, r.source_record_id,
+                    r.current_holder_id, r.current_holder_name,
+                    r.target_holder_id, r.target_holder_name,
+                    r.business_status,
+                    r.last_inventory_id, r.last_inventory_result, r.last_inventory_time,
+                    r.admin_remark, r.draft_remark,
+                    "是" if r.borrower_confirm else "否",
+                    r.borrower_remark, r.objection_reason,
+                    r.created_by, r.created_by_role, r.created_at,
+                    r.confirmed_by, r.confirmed_at,
+                    r.completed_by, r.completed_at,
+                    r.final_conclusion, r.status
+                ])
+        return True
+    except (IOError, OSError):
+        return False
+
+
+def export_handoff_json(records: List[HandoffRecord], filepath: str,
+                        filter_info: Optional[dict] = None,
+                        operator: str = "") -> bool:
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            data = {
+                "export_time": _now_str(),
+                "export_operator": operator,
+                "records": [r.to_dict() for r in records],
+            }
+            if filter_info:
+                safe_filter = {k: v for k, v in filter_info.items() if k != "_alert_status"}
+                data["filter_info"] = safe_filter
             json.dump(data, f, ensure_ascii=False, indent=2)
         return True
     except (IOError, OSError):

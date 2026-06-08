@@ -44,14 +44,20 @@ class UserRole:
                 "send_to_maintenance", "cancel_maintenance",
                 "view_maintenance", "export_maintenance",
                 "create_inventory", "fill_inventory", "complete_inventory",
-                "view_inventory", "export_inventory"],
+                "view_inventory", "export_inventory",
+                "view_handoff_all", "create_handoff", "edit_handoff",
+                "complete_handoff", "export_handoff",
+                "view_own_handoff", "confirm_handoff", "object_handoff"],
         BORROWER: ["borrow_device", "view_own", "export_data",
-                   "view_own_inventory"],
+                   "view_own_inventory",
+                   "view_own_handoff", "confirm_handoff", "object_handoff"],
         INSPECTOR: ["inspect_return", "return_device", "close_record",
                     "view_all", "export_data", "import_records",
                     "set_reminder_days",
                     "view_maintenance", "export_maintenance",
-                    "fill_inventory", "view_inventory", "export_inventory"],
+                    "fill_inventory", "view_inventory", "export_inventory",
+                    "view_handoff_all", "export_handoff",
+                    "view_own_handoff", "confirm_handoff", "object_handoff"],
     }
 
     @classmethod
@@ -325,6 +331,62 @@ class InventorySession:
         return cls(**d)
 
 
+class HandoffAction:
+    BORROW_OUT = "借出"
+    RETURN_BACK = "归还"
+    MAINTENANCE_BACK = "维修后交回"
+    FREEZE_RELEASE = "冻结解除"
+
+    ALL_ACTIONS = [BORROW_OUT, RETURN_BACK, MAINTENANCE_BACK, FREEZE_RELEASE]
+
+
+class HandoffStatus:
+    PENDING = "待确认"
+    CONFIRMED = "已确认"
+    OBJECTED = "有异议"
+    COMPLETED = "已完成"
+
+    ALL_STATUSES = [PENDING, CONFIRMED, OBJECTED, COMPLETED]
+
+
+@dataclass
+class HandoffRecord:
+    id: str = field(default_factory=_new_id)
+    device_id: str = ""
+    device_name: str = ""
+    action_type: str = HandoffAction.BORROW_OUT
+    source_record_id: str = ""
+    current_holder_id: str = ""
+    current_holder_name: str = ""
+    target_holder_id: str = ""
+    target_holder_name: str = ""
+    business_status: str = ""
+    last_inventory_id: str = ""
+    last_inventory_result: str = ""
+    last_inventory_time: str = ""
+    admin_remark: str = ""
+    draft_remark: str = ""
+    borrower_confirm: bool = False
+    borrower_remark: str = ""
+    objection_reason: str = ""
+    created_by: str = ""
+    created_by_role: str = ""
+    created_at: str = field(default_factory=_now_str)
+    confirmed_by: str = ""
+    confirmed_at: str = ""
+    completed_by: str = ""
+    completed_at: str = ""
+    final_conclusion: str = ""
+    status: str = HandoffStatus.PENDING
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict):
+        return cls(**d)
+
+
 @dataclass
 class AppConfig:
     export_dir: str = ""
@@ -338,6 +400,7 @@ class AppConfig:
     maintenance_records_snapshot: dict = field(default_factory=dict)
     last_inventory_filter: dict = field(default_factory=dict)
     last_active_inventory_session_id: str = ""
+    last_handoff_filter: dict = field(default_factory=dict)
 
     def to_dict(self):
         return asdict(self)
