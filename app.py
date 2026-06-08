@@ -1228,7 +1228,11 @@ class ImportPrecheckDialog(tk.Toplevel):
         btns = ttk.Frame(main)
         btns.pack(pady=(10, 0))
         ok_btn = ttk.Button(btns, text="确认导入", command=self._ok)
-        if self.summary.importable == 0:
+        s = self.summary
+        has_issue = (s.field_missing > 0 or s.device_not_found > 0
+                     or s.device_status_conflict > 0 or s.borrower_not_found > 0
+                     or s.duplicate > 0)
+        if has_issue:
             ok_btn.config(state="disabled")
         ok_btn.pack(side="left", padx=6)
         ttk.Button(btns, text="取消", command=self.destroy).pack(side="left", padx=6)

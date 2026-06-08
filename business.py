@@ -522,17 +522,33 @@ class EquipmentManager:
         pre_ok, pre_msg, summary = self.precheck_import_file(filepath)
         if not pre_ok:
             self._append_import_log(filepath, fmt, len(rows), 0, len(rows), [pre_msg])
-            return False, pre_msg, 0, 0
-        if summary.importable == 0:
-            reason = "没有可导入的记录：" + "；".join([
-                f"字段缺失 {summary.field_missing}",
-                f"设备不存在 {summary.device_not_found}",
-                f"设备状态冲突 {summary.device_status_conflict}",
-                f"借用人不存在 {summary.borrower_not_found}",
-                f"重复记录 {summary.duplicate}",
-            ])
-            self._append_import_log(filepath, fmt, len(rows), 0, len(rows), [reason])
-            return False, reason, 0, 0
+            return False, pre_msg, 0, len(rows)
+        has_issue = (
+            summary.field_missing > 0 or summary.device_not_found > 0
+            or summary.device_status_conflict > 0 or summary.borrower_not_found > 0
+            or summary.duplicate > 0
+        )
+        if has_issue:
+            parts = []
+            if summary.field_missing:
+                parts.append(f"字段缺失 {summary.field_missing}")
+            if summary.device_not_found:
+                parts.append(f"设备不存在 {summary.device_not_found}")
+            if summary.device_status_conflict:
+                parts.append(f"设备状态冲突 {summary.device_status_conflict}")
+            if summary.borrower_not_found:
+                parts.append(f"借用人不存在 {summary.borrower_not_found}")
+            if summary.duplicate:
+                parts.append(f"重复记录 {summary.duplicate}")
+            reason = (
+                "预检发现问题，整批未写入（必须全部合法才可导入："
+                + "；".join(parts)
+                + "。"
+            )
+            self._append_import_log(
+                filepath, fmt, len(rows), 0, len(rows), [reason]
+            )
+            return False, reason, 0, len(rows)
 
         devices_backup = copy.deepcopy(self.devices)
         records_backup = copy.deepcopy(self.records)
