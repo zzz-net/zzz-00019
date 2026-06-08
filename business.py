@@ -34,6 +34,9 @@ class EquipmentManager:
         self.users = storage.load_users()
         self.maintenance_logs = storage.load_maintenance_logs()
         self.config = storage.load_config()
+        self._records_snapshot_at_last_maintenance = dict(
+            self.config.maintenance_records_snapshot or {}
+        )
         if self.config.last_user:
             self.current_user = self.find_user(self.config.last_user)
 
@@ -827,7 +830,7 @@ class EquipmentManager:
         from_status = device.status
         device.status = DeviceStatus.MAINTENANCE
         device.remark = (device.remark + "\n" if device.remark else "") + \
-                        f"[{_now_str()}] 送修/保养：{reason.strip()}"
+                        f"[{_now_str()}] 状态变更：{from_status} → {DeviceStatus.MAINTENANCE}（送修/保养：{reason.strip()}）"
 
         rec = MaintenanceRecord(
             device_id=device.id,
@@ -840,7 +843,9 @@ class EquipmentManager:
             status="in_progress",
         )
         self.maintenance_logs.append(rec)
-        self._records_snapshot_at_last_maintenance = self._make_records_snapshot()
+        snap = self._make_records_snapshot()
+        self._records_snapshot_at_last_maintenance = snap
+        self.config.maintenance_records_snapshot = snap
         self.save_all()
         return rec, f"设备【{device.name}】已登记为维修/保养（原因：{reason.strip()}）"
 
@@ -879,11 +884,13 @@ class EquipmentManager:
             recover_to = DeviceStatus.AVAILABLE
         device.status = recover_to
         device.remark = (device.remark + "\n" if device.remark else "") + \
-                        f"[{_now_str()}] 撤销维修：{remark.strip() if remark else '未说明'}"
+                        f"[{_now_str()}] 状态变更：{DeviceStatus.MAINTENANCE} → {recover_to}（撤销维修：{remark.strip() if remark else '未说明'}）"
 
         active_m.status = "cancelled"
         active_m.end_time = _now_str()
         active_m.cancel_remark = remark.strip() if remark else ""
+        self._records_snapshot_at_last_maintenance = {}
+        self.config.maintenance_records_snapshot = {}
         self.save_all()
         return active_m, f"已撤销维修登记，设备恢复为【{recover_to}】"
 

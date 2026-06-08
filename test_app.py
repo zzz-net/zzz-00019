@@ -1602,6 +1602,76 @@ def test_maintenance_log_persistence_across_restart():
     assert_eq(dev.status, DeviceStatus.MAINTENANCE, "设备状态也正确持久化为维修中")
 
 
+def test_maintenance_cancel_boundary_after_restart():
+    print("\n=== 测试42: 维修/保养 - 送修后新增借用→重启→撤销失败（快照持久化边界） ===")
+    setup_test_env()
+    mgr = EquipmentManager()
+    mgr.switch_user("admin")
+    avail = next(d for d in mgr.devices if d.status == DeviceStatus.AVAILABLE)
+    rec, _ = mgr.send_to_maintenance(avail.id, "正常保养", "")
+    can_before, _ = mgr.can_cancel_maintenance(avail.id)
+    assert_true(can_before, "刚送修后无借用变化时可以撤销")
+
+    another_dev = next(d for d in mgr.devices
+                    if d.id != avail.id and d.status == DeviceStatus.AVAILABLE)
+    br = next(b for b in mgr.borrowers)
+    mgr.borrow_device(another_dev.id, br.id,
+                      (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"),
+                      [], "测试产生新借用")
+
+    mgr2 = EquipmentManager()
+    mgr2.switch_user("admin")
+    can_after, reason_after = mgr2.can_cancel_maintenance(avail.id)
+    assert_true(not can_after, "重启后仍能检测到新增借用→撤销被拦截")
+    assert_true("变化" in reason_after, "错误消息含变化提示")
+    try:
+        mgr2.cancel_last_maintenance(avail.id, "测试撤销")
+        assert_true(False, "应当抛出 BusinessError")
+    except BusinessError:
+        assert_true(True, "重启后依然阻止撤销")
+
+    dev_after = mgr2.find_device(avail.id)
+    assert_eq(dev_after.status, DeviceStatus.MAINTENANCE,
+               "设备状态仍保持维修中，未被错误恢复")
+    persisted_maint = [m for m in mgr2.maintenance_logs if m.id == rec.id]
+    assert_eq(len(persisted_maint), 1, "维修记录仍为进行中，未被标记已撤销")
+    assert_eq(persisted_maint[0].status, "in_progress", "记录状态为进行中")
+    disk_config = storage.load_config()
+    assert_true(len(disk_config.maintenance_records_snapshot) > 0,
+                  "config 中保存了快照，重启后依然生效")
+
+
+def test_maintenance_frozen_device_remark_history():
+    print("\n=== 测试43: 维修/保养 - 异常冻结送修后 remark 含「异常冻结→维修中状态历史 ===")
+    setup_test_env()
+    mgr = EquipmentManager()
+    mgr.switch_user("admin")
+    frozen_dev = next(d for d in mgr.devices if d.status == DeviceStatus.FROZEN)
+    if not frozen_dev:
+        frozen_dev = Device(name="冻结设备", category="测试", status=DeviceStatus.FROZEN)
+        mgr.devices.append(frozen_dev)
+        mgr.save_all()
+    _ = mgr.send_to_maintenance(frozen_dev.id, "冻住了需要修", "")
+    dev = mgr.find_device(frozen_dev.id)
+    assert_eq(dev.status, DeviceStatus.MAINTENANCE)
+    assert_true("异常冻结" in dev.remark and "维修中" in dev.remark,
+                 "设备 remark 中明确包含「异常冻结 → 维修中」状态变更记录")
+    assert_true("送修/保养" in dev.remark and "冻住了需要修" in dev.remark,
+                 "设备 remark 包含送修原因")
+    active_m = mgr.get_active_maintenance_for_device(frozen_dev.id)
+    assert_eq(active_m.from_status, DeviceStatus.FROZEN,
+              "维修记录 from_status 为异常冻结")
+    _, _ = mgr.cancel_last_maintenance(frozen_dev.id, "无需维修")
+    dev2 = mgr.find_device(frozen_dev.id)
+    assert_eq(dev2.status, DeviceStatus.FROZEN, "撤销后恢复为异常冻结，而非默认可借出")
+    assert_true("维修中" in dev2.remark and "异常冻结" in dev2.remark,
+                 "撤销 remark 也包含「维修中 → 异常冻结」状态变更")
+    mgr2 = EquipmentManager()
+    dev3 = mgr2.find_device(frozen_dev.id)
+    assert_true("异常冻结" in dev3.remark and "维修中" in dev3.remark,
+                 "重启后 remark 历史持久化保留")
+
+
 def main():
     setup_test_env()
     try:
@@ -1646,6 +1716,8 @@ def main():
         test_maintenance_import_intercept()
         test_maintenance_export_with_filter_info()
         test_maintenance_log_persistence_across_restart()
+        test_maintenance_cancel_boundary_after_restart()
+        test_maintenance_frozen_device_remark_history()
     finally:
         cleanup_test_env()
 

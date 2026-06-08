@@ -262,6 +262,7 @@ class AppConfig:
     reminder_days: int = 3
     default_maintenance_days: int = 7
     last_maintenance_filter: dict = field(default_factory=dict)
+    maintenance_records_snapshot: dict = field(default_factory=dict)
 
     def to_dict(self):
         return asdict(self)
