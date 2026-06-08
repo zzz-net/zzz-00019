@@ -1220,9 +1220,19 @@ class ImportPrecheckDialog(tk.Toplevel):
                 iss.get("detail", "")
             ))
 
-        tip = ttk.Label(main,
-                        text="提示：点击【确认导入】将仅写入可导入记录；若中途出错，整批回滚。",
-                        foreground="#2980b9")
+        s = self.summary
+        has_issue = (s.field_missing > 0 or s.device_not_found > 0
+                     or s.device_status_conflict > 0 or s.borrower_not_found > 0
+                     or s.duplicate > 0)
+        if has_issue:
+            tip_text = ("提示：存在待修正的问题（见上方明细），【确认导入】已禁用；"
+                        "必须全部记录合法才可导入，否则整批不会写入任何一行。")
+            tip_color = "#c0392b"
+        else:
+            tip_text = ("提示：所有记录均通过预检，点击【确认导入】将整批写入；"
+                        "若中途异常会自动回滚，不留半条记录。")
+            tip_color = "#2980b9"
+        tip = ttk.Label(main, text=tip_text, foreground=tip_color)
         tip.pack(anchor="w", pady=(6, 0))
 
         btns = ttk.Frame(main)
